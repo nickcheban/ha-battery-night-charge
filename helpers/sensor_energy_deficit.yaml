@@ -105,14 +105,21 @@ state: >
       {% set date_str = today_str if use_today else tomorrow_str %}
 
       {% set om_key = date_str + 'T' + '%02d'|format(h) + ':00:00+03:00' %}
+      {% set om_present = om_key in om_map %}
       {% set om_wh  = om_map.get(om_key, 0) | float(0) %}
       {% set sc_match = sc_list | selectattr('period_start.hour', 'eq', h) | list %}
+      {% set sc_present = sc_match | count > 0 %}
       {% set sc_wh  = (sc_match[0].pv_estimate | float(0)) * 1000
-                      if sc_match | count > 0 else 0 %}
+                      if sc_present else 0 %}
 
+      {# Use presence of a data point, not a magnitude threshold, to decide  #}
+      {# whether a source counts — a genuine low-but-nonzero forecast (e.g. #}
+      {# 3 Wh at dawn) must still be eligible for the min(), otherwise the   #}
+      {# "always take the conservative source" rule silently breaks for     #}
+      {# low values near sunrise/sunset.                                    #}
       {% set candidates = [] %}
-      {% if om_wh > 10 %}{% set candidates = candidates + [om_wh] %}{% endif %}
-      {% if sc_wh > 10 %}{% set candidates = candidates + [sc_wh] %}{% endif %}
+      {% if om_present %}{% set candidates = candidates + [om_wh] %}{% endif %}
+      {% if sc_present %}{% set candidates = candidates + [sc_wh] %}{% endif %}
       {% set gen_wh  = candidates | min if candidates | count > 0 else 0 %}
       {% set load_wh = load_profile[h] %}
       {% set gen_ge  = gen_wh >= load_wh %}
