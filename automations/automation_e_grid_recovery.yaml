@@ -1,0 +1,180 @@
+# Automation E: Grid recovery after voltage relay trip
+# =====================================================
+# Fires when breaker voltage rises above 210 V and holds for 2 minutes.
+# This is the reliable signal that the grid has actually returned — phantom
+# voltage readings (10–175 V from a de-energised chip) cannot sustain 210 V+
+# for 2 minutes. See docs/phantom_voltage.md for full analysis.
+#
+# Why this automation is necessary:
+#   Cheap Zigbee breakers power their radio chip from the switched line. When
+#   an upstream voltage protection relay cuts the grid, the breaker chip dies.
+#   Commands sent during this period are lost. When the grid returns, the
+#   breaker restores its last saved state — but automation A may have already
+#   fired (at 23:05) and been unable to turn the breaker on. This automation
+#   re-evaluates and takes the correct action when the grid actually comes back.
+#
+# Four branches (evaluated in order, first match wins):
+#
+#   Branch 1 — Night + charge needed → turn ON
+#     Time: 23:01–06:58, energy_deficit > 0.5 kWh, SOC valid, breaker off
+#     → resume charging
+#
+#   Branch 2 — Night + target already reached → turn OFF
+#     Time: 23:01–06:58, SOC ≥ min(target+2%, 95%), breaker on
+#     → breaker came back on via "restore previous state" but target is met;
+#        turn it off to stop over-charging
+#
+#   Branch 3 — Daytime (06:58–23:01) → force OFF
+#     Breaker on during peak tariff hours → turn off unconditionally
+#     Handles the scenario where the breaker returned from "restore" as ON
+#     during daytime, which would charge from expensive peak electricity
+#     Ends at 23:01 (not 23:04) to exactly match the start of the night
+#     window in branches 1/2 — an earlier version left a 3-minute overlap
+#     (23:01–23:04) where both this branch and the night branches could
+#     match simultaneously.
+#
+#   Branch 4 — Battery critically low → turn ON any time
+#     Battery voltage < 49 V regardless of time or tariff
+#     Emergency: keep the house from losing power entirely
+#     Note: 49 V as a threshold for LiFePO4 is based on inverter voltage
+#     measurement, validated against BMS data (mean deviation < 0.15 V
+#     across 86 paired hourly readings). Will be updated to BMS-based SOC
+#     threshold when the new inverter provides direct BMS data.
+#
+# Time boundary: branches 1 and 2 use after: 23:01 (not 23:00) to allow
+# one minute for forecast integrations to complete their midnight entity
+# rotation (today ↔ tomorrow). Acting in the first seconds of midnight on
+# stale "tomorrow" data is the known risk mitigated here.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.breaker_voltage          → voltage sensor on the smart breaker (V)
+#   switch.grid_switch              → your smart breaker switch entity
+#   sensor.energy_deficit           → energy deficit template sensor (kWh)
+#   sensor.battery_soc_effective    → BMS SOC sensor
+#   input_number.locked_target_soc  → helper written by automation A at 23:05
+#   sensor.battery_voltage          → inverter battery voltage sensor (V)
+#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+
+alias: "EMS: Grid recovery (E)"
+description: >
+  v1.2 — fires when breaker voltage > 210 V for 2 minutes (real grid returned).
+  Four branches: charge if needed / confirm target reached / force off daytime /
+  emergency on if battery critically low. Time boundary 23:01 to buffer
+  midnight forecast entity rotation.
+
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.breaker_voltage
+    above: 210
+    for:
+      minutes: 2
+
+conditions: []
+
+actions:
+  - choose:
+      # Branch 1: Night window + charge still needed → turn breaker ON
+      - alias: "Night + charge needed → turn on"
+        conditions:
+          - condition: time
+            after: "23:01:00"
+            before: "06:58:00"
+          - condition: numeric_state
+            entity_id: sensor.energy_deficit
+            above: 0.5
+          - alias: "SOC reading is valid"
+            condition: template
+            value_template: >
+              {{ states('sensor.battery_soc_effective') not in
+                 ['unavailable', 'unknown', 'none', 'None', ''] }}
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "off"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                🔌 *EMS: Grid returned — breaker ON (E)*
+                SOC: {{ states('sensor.battery_soc_effective') }}%
+                | Need: +{{ states('sensor.energy_deficit') }} kWh
+                | Target: {{ states('input_number.locked_target_soc') | int }}%
+
+      # Branch 2: Night window + target already reached → turn breaker OFF
+      - alias: "Night + target reached → turn off"
+        conditions:
+          - condition: time
+            after: "23:01:00"
+            before: "06:58:00"
+          - condition: template
+            value_template: >
+              {% set current = states('sensor.battery_soc_effective') | float(-1) %}
+              {% set target = states('input_number.locked_target_soc') | int(20) %}
+              {% set threshold = [target + 2, 95] | min %}
+              {{ current >= 0 and current >= threshold }}
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "on"
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ✅ *EMS: Grid returned — target already met, breaker OFF (E)*
+                SOC: {{ states('sensor.battery_soc_effective') }}%
+                ≥ target {{ states('input_number.locked_target_soc') | int }}% + 2%
+
+      # Branch 3: Daytime (06:58–23:01) → force breaker OFF unconditionally
+      - alias: "Daytime → force off"
+        conditions:
+          - condition: time
+            after: "06:58:00"
+            before: "23:01:00"
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "on"
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ☀️ *EMS: Grid returned daytime — breaker forced OFF (E)*
+                Peak tariff hours. SOC: {{ states('sensor.battery_soc_effective') }}%.
+                Breaker turned off to avoid peak tariff consumption.
+
+      # Branch 4: Battery critically low → turn ON regardless of time or tariff
+      - alias: "Emergency — battery critically low → turn on"
+        conditions:
+          - condition: numeric_state
+            entity_id: sensor.battery_voltage
+            below: 49
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "off"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ⚠️ *EMS: EMERGENCY — battery critically low, breaker ON (E)*
+                Grid returned. Battery voltage:
+                {{ states('sensor.battery_voltage') }} V (< 49 V threshold).
+                Breaker turned on regardless of time or tariff.
+
+mode: single

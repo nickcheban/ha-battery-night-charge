@@ -1,0 +1,39 @@
+# Automation D: Morning safety off — unconditional
+# ==================================================
+# Turns the grid breaker off at 06:58 every morning.
+# No conditions. No notification. No exceptions.
+#
+# This is the dumb safety layer that exists specifically because smart logic
+# can fail. If automation A misfired, if B never triggered, if C got stuck,
+# if the BMS is unavailable, if the forecast API was down all night — this
+# automation fires anyway and turns the breaker off before daytime peak tariff.
+#
+# Deliberately minimal:
+#   - No conditions: must work even if every sensor is unavailable
+#   - No notification: was removed by user request — a "target not reached"
+#     notification based on a snapshot from 23:05 was misleading by 06:58
+#     (the target was stale, and the breaker was already being managed by
+#     automations B and C throughout the night)
+#   - mode: single: cannot fire twice
+#
+# Entity ID mapping (replace with your own):
+#   switch.grid_switch → your smart breaker switch entity
+
+alias: "EMS: Morning safety off (D)"
+description: >
+  v2.4 — unconditional breaker off at 06:58. Safety layer, no conditions,
+  no notification. This is the automation that must work even if everything
+  else is broken.
+
+triggers:
+  - trigger: time
+    at: "06:58:00"
+
+conditions: []
+
+actions:
+  - action: switch.turn_off
+    target:
+      entity_id: switch.grid_switch
+
+mode: single

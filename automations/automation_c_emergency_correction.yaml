@@ -1,0 +1,124 @@
+# Automation C: Emergency night correction
+# ==========================================
+# Reacts to sensor.energy_deficit changing during the night — handles the
+# case where reality diverges from the forecast mid-night.
+#
+# Two triggers:
+#   need_charge: energy_deficit rises above 0.7 kWh for 2 minutes → turn ON
+#   stop_charge: energy_deficit falls below 0.3 kWh              → turn OFF
+#
+# Hysteresis (0.7 on / 0.3 off) prevents oscillation — the breaker won't
+# flicker on/off if the deficit hovers near a single threshold.
+#
+# mode: restart ensures a fresh trigger always takes priority over a previous
+# run still resolving its sequence (e.g. a new need_charge trigger cancels
+# a stop_charge that was in progress).
+#
+# Design decisions:
+#
+#   for: 2 minutes on need_charge (not stop_charge)
+#     Two minutes of sustained deficit confirms the situation is real, not
+#     a transient BMS flap. No delay on stop_charge — there is no cost to
+#     turning off slightly early, but leaving the breaker on when it shouldn't
+#     be wastes grid electricity.
+#
+#   Voltage check on turn-on only
+#     The >210 V voltage check (real grid present) is applied to the turn-on
+#     branch. No voltage check on turn-off — we always want to be able to
+#     turn the breaker off.
+#
+#   SOC validity on turn-off
+#     Prevents false turn-off caused by BMS flapping to unknown — when SOC
+#     becomes unknown, energy_deficit sensor returns 0 (by design, as a safety
+#     default), which would trigger stop_charge. The validity check blocks this.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.energy_deficit           → energy deficit template sensor (kWh)
+#   switch.grid_switch              → your smart breaker switch entity
+#   sensor.breaker_voltage          → voltage sensor on the smart breaker (V)
+#   sensor.battery_soc_effective    → BMS SOC sensor
+#   input_number.locked_target_soc  → helper written by automation A at 23:05
+#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+
+alias: "EMS: Emergency night correction (C)"
+description: >
+  v2.5 — reacts to energy_deficit crossing 0.7 kWh (on) / 0.3 kWh (off)
+  during the night window 23:06–06:57. Hysteresis prevents oscillation.
+  Voltage >210 V check on turn-on. SOC validity check on turn-off prevents
+  false off when BMS flaps to unknown (which causes energy_deficit → 0).
+
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.energy_deficit
+    above: 0.7
+    for:
+      minutes: 2
+    id: need_charge
+  - trigger: numeric_state
+    entity_id: sensor.energy_deficit
+    below: 0.3
+    id: stop_charge
+
+conditions:
+  - condition: time
+    after: "23:06:00"
+    before: "06:57:00"
+  - alias: "SOC reading is valid"
+    condition: template
+    value_template: >
+      {{ states('sensor.battery_soc_effective') not in
+         ['unavailable', 'unknown', 'none', 'None', ''] }}
+
+actions:
+  - choose:
+      - alias: "Deficit too high — turn breaker on"
+        conditions:
+          - condition: trigger
+            id: need_charge
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "off"
+          - condition: numeric_state
+            entity_id: sensor.breaker_voltage
+            above: 210
+            alias: "Real grid present (>210 V, not phantom voltage)"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ⚡ *EMS: Emergency charge — night (C)*
+                Need: {{ states('sensor.energy_deficit') }} kWh
+                | SOC: {{ states('sensor.battery_soc_effective') }}%
+                | Target: {{ states('input_number.locked_target_soc') | int }}%
+
+      - alias: "Deficit cleared — turn breaker off"
+        conditions:
+          - condition: trigger
+            id: stop_charge
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "on"
+          - alias: "SOC valid before turning off"
+            condition: template
+            value_template: >
+              {{ states('sensor.battery_soc_effective') not in
+                 ['unavailable', 'unknown', 'none', 'None', ''] }}
+        sequence:
+          - action: switch.turn_off
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ✅ *EMS: Deficit cleared — breaker off (C)*
+                Remaining: {{ states('sensor.energy_deficit') }} kWh
+                | SOC: {{ states('sensor.battery_soc_effective') }}%
+
+mode: restart

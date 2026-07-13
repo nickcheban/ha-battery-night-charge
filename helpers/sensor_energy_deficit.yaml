@@ -1,0 +1,146 @@
+# Template sensor: sensor.energy_deficit
+# =======================================
+# Core sensor of the EMS. Calculates how many kWh are needed right now
+# to keep the battery above the safety floor until generation reliably
+# covers household load.
+#
+# The sensor dynamically recalculates from the *current* hour forward —
+# not always from 23:00. This means at 05:00 it only sums the hours
+# still ahead (05–11), not the entire night. See docs/model.md for the
+# full design rationale and two bugs found during development.
+#
+# Algorithm:
+#   Walk hours [current_hour → 11] in night order.
+#   For each hour: gen = min(solcast, open_meteo). Load = profile[season][hour].
+#   Accumulate deficit. Stop when gen ≥ load two hours in a row.
+#   target_need = deficit / eta + floor + reserve
+#   result = max(target_need - current_energy, 0)
+#
+# Returns 0 (no action needed) when:
+#   - Current time is outside the night window (12:00–22:59)
+#   - BMS SOC is unavailable/unknown (safety: don't charge on missing data)
+#
+# How to install:
+#   Settings → Devices & Services → Helpers → Create Helper → Template sensor
+#   Paste the content of the `state:` block below.
+#   Set: device_class = energy, unit_of_measurement = kWh
+#
+# Load profile:
+#   The load_profile_by_season dict below is built from ~110 days of real
+#   household consumption data. Replace these numbers with your own home's
+#   actual hourly mean consumption in Watts before deploying.
+#   See docs/model.md for methodology.
+#
+# Entity ID mapping (replace with your own):
+#   input_number.battery_capacity_kwh  → usable battery capacity in kWh
+#   input_number.minimum_soc_floor     → minimum SOC % you want at dawn
+#   sensor.battery_soc_effective       → BMS SOC sensor (must go unavailable)
+#   sensor.energy_production_today/tomorrow   → Open-Meteo Solar Forecast
+#   sensor.pv_forecast_today/tomorrow  → Solcast integration entities
+
+state: >
+  {% set bat = states('input_number.battery_capacity_kwh') | float(13.3) %}
+  {% set eta = 0.92 %}
+  {% set cur_h = now().hour %}
+  {% set cur_min = now().minute %}
+  {% set month = now().month %}
+  {% set season = 'winter' if month in [12,1,2] else
+                  ('transition' if month in [3,4,10,11] else 'summer') %}
+
+  {# ── Seasonal hourly load profile (mean W per hour) ───────────────────── #}
+  {# Replace these values with your own household's actual consumption data.  #}
+  {# winter = transition here — no real winter data available yet (system     #}
+  {# deployed in late February; will be updated after first full winter).     #}
+  {% set load_profile_by_season = {
+    'winter':     {0:707,1:666,2:550,3:451,4:440,5:540,6:620,7:729,
+                   8:802,9:851,10:845,11:782,12:720,13:701,14:753,
+                   15:748,16:800,17:752,18:725,19:861,20:972,21:882,
+                   22:766,23:715},
+    'transition': {0:707,1:666,2:550,3:451,4:440,5:540,6:620,7:729,
+                   8:802,9:851,10:845,11:782,12:720,13:701,14:753,
+                   15:748,16:800,17:752,18:725,19:861,20:972,21:882,
+                   22:766,23:715},
+    'summer':     {0:586,1:525,2:408,3:340,4:376,5:517,6:668,7:728,
+                   8:776,9:827,10:794,11:791,12:796,13:752,14:802,
+                   15:720,16:749,17:688,18:735,19:898,20:1002,21:857,
+                   22:678,23:643}
+  } %}
+  {% set load_profile = load_profile_by_season[season] %}
+
+  {# ── Forecast data ────────────────────────────────────────────────────── #}
+  {% set om_today    = state_attr('sensor.energy_production_today', 'wh_period') or {} %}
+  {% set om_tomorrow = state_attr('sensor.energy_production_tomorrow', 'wh_period') or {} %}
+  {% set sc_today    = state_attr('sensor.pv_forecast_today', 'detailedHourly') or [] %}
+  {% set sc_tomorrow = state_attr('sensor.pv_forecast_tomorrow', 'detailedHourly') or [] %}
+  {% set today_str    = now().strftime('%Y-%m-%d') %}
+  {% set tomorrow_str = (now() + timedelta(days=1)).strftime('%Y-%m-%d') %}
+
+  {# ── Night window and active hours ───────────────────────────────────── #}
+  {% set full_window = [23,0,1,2,3,4,5,6,7,8,9,10,11] %}
+  {% set in_window = (cur_h == 23) or (cur_h <= 11) %}
+  {% if in_window %}
+    {% set start_idx = full_window.index(cur_h) %}
+    {% set active_window = full_window[start_idx:] %}
+  {% else %}
+    {% set active_window = [] %}
+  {% endif %}
+
+  {# started_at_23: true if we are at the start of the window (23:xx) or   #}
+  {# within 5 minutes of midnight (buffer for forecast entity rotation lag) #}
+  {% set started_at_23 = (cur_h == 23) or (cur_h == 0 and cur_min < 5) %}
+
+  {# ── Hourly deficit accumulation ─────────────────────────────────────── #}
+  {% set ns = namespace(deficit_wh=0, covered=false, prev_gen_ge=false) %}
+  {% for h in active_window %}
+    {% if not ns.covered %}
+      {% if h == 23 %}
+        {% set use_today = true %}
+      {% elif started_at_23 %}
+        {% set use_today = false %}
+      {% else %}
+        {% set use_today = true %}
+      {% endif %}
+      {% set om_map   = om_today if use_today else om_tomorrow %}
+      {% set sc_list  = sc_today if use_today else sc_tomorrow %}
+      {% set date_str = today_str if use_today else tomorrow_str %}
+
+      {% set om_key = date_str + 'T' + '%02d'|format(h) + ':00:00+03:00' %}
+      {% set om_wh  = om_map.get(om_key, 0) | float(0) %}
+      {% set sc_match = sc_list | selectattr('period_start.hour', 'eq', h) | list %}
+      {% set sc_wh  = (sc_match[0].pv_estimate | float(0)) * 1000
+                      if sc_match | count > 0 else 0 %}
+
+      {% set candidates = [] %}
+      {% if om_wh > 10 %}{% set candidates = candidates + [om_wh] %}{% endif %}
+      {% if sc_wh > 10 %}{% set candidates = candidates + [sc_wh] %}{% endif %}
+      {% set gen_wh  = candidates | min if candidates | count > 0 else 0 %}
+      {% set load_wh = load_profile[h] %}
+      {% set gen_ge  = gen_wh >= load_wh %}
+
+      {% set ns.deficit_wh = ns.deficit_wh + [load_wh - gen_wh, 0] | max %}
+      {% if gen_ge and ns.prev_gen_ge %}
+        {% set ns.covered = true %}
+      {% endif %}
+      {% set ns.prev_gen_ge = gen_ge %}
+    {% endif %}
+  {% endfor %}
+
+  {# ── Final calculation ───────────────────────────────────────────────── #}
+  {% set night_need  = (ns.deficit_wh / 1000) / eta %}
+  {% set floor_pct   = states('input_number.minimum_soc_floor') | float(20) %}
+  {% set floor_kwh   = floor_pct / 100 * bat %}
+  {% set reserve_kwh = 1.5 %}
+  {% set total_need  = [night_need + floor_kwh + reserve_kwh, bat * 0.95] | min
+                       if in_window else 0 %}
+
+  {% set soc     = states('sensor.battery_soc_effective') %}
+  {% set soc_ok  = soc not in ['unavailable', 'unknown', 'none', 'None', ''] %}
+  {% if not soc_ok or not in_window %}
+    0
+  {% else %}
+    {% set energy_now = soc | float / 100 * bat %}
+    {{ [total_need - energy_now, 0] | max | round(2) }}
+  {% endif %}
+
+unit_of_measurement: kWh
+device_class: energy

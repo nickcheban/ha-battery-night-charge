@@ -1,0 +1,77 @@
+# Automation B: Turn off breaker when target SOC is reached
+# ==========================================================
+# Watches sensor.battery_soc_effective throughout the night.
+# Turns the breaker off as soon as SOC has held at or above
+# min(locked_target + 2%, 95%) for 30 seconds.
+#
+# Design decisions:
+#
+#   for: 30 seconds (not 2 minutes)
+#     BMS units commonly report SOC as `unknown` for ~35 seconds during active
+#     charging (cell balancing, BMS internal polling cycles). A 2-minute window
+#     almost never fires because `unknown` breaks the state continuity. 30 s
+#     is long enough to ignore transient flaps, short enough to catch the real
+#     target crossing.
+#
+#   min(target + 2%, 95%) threshold
+#     The +2% buffer prevents the breaker from turning off right at the target
+#     and then immediately triggering automation C (emergency correction) which
+#     would turn it back on. The 95% cap ensures this automation doesn't stall
+#     if locked_target_soc is set to 95% or above.
+#
+#   SOC validity check
+#     Explicit check that SOC is not unavailable/unknown before acting.
+#     Prevents false turn-off when BMS flaps to unknown mid-charge.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.battery_soc_effective    → BMS SOC sensor
+#   switch.grid_switch              → your smart breaker switch entity
+#   input_number.locked_target_soc  → helper written by automation A at 23:05
+#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+
+alias: "EMS: Breaker off — target SOC reached (B)"
+description: >
+  v2.5 — turns breaker off when SOC ≥ min(target+2%, 95%) stable for 30 s.
+  30 s debounce chosen because BMS units flap to unknown ~35 s during charging,
+  making longer windows unreliable. SOC validity check prevents false off on flap.
+
+triggers:
+  - trigger: state
+    entity_id: sensor.battery_soc_effective
+    for:
+      seconds: 30
+
+conditions:
+  - condition: state
+    entity_id: switch.grid_switch
+    state: "on"
+  - condition: time
+    after: "23:05:00"
+    before: "06:57:00"
+  - alias: "SOC reached min(target+2, 95)"
+    condition: template
+    value_template: >
+      {% set current = states('sensor.battery_soc_effective') | float(-1) %}
+      {% set target = states('input_number.locked_target_soc') | int(20) %}
+      {% set threshold = [target + 2, 95] | min %}
+      {{ current >= 0 and current >= threshold }}
+  - alias: "SOC reading is valid"
+    condition: template
+    value_template: >
+      {{ states('sensor.battery_soc_effective') not in
+         ['unavailable', 'unknown', 'none', 'None', ''] }}
+
+actions:
+  - action: switch.turn_off
+    target:
+      entity_id: switch.grid_switch
+  - action: notify.send_message
+    target:
+      entity_id: notify.YOUR_TELEGRAM_BOT
+    data:
+      message: >
+        🔋 *EMS: Target reached — breaker OFF (B)*
+        SOC: {{ states('sensor.battery_soc_effective') }}% reached target
+        {{ states('input_number.locked_target_soc') | int }}% + 2% buffer
+
+mode: single

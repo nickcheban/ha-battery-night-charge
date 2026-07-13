@@ -1,0 +1,113 @@
+# Automation A: Lock target SOC and start night charge
+# ======================================================
+# Fires once per night at 23:05 (local time).
+#
+# Steps:
+#   1. Snapshots the current target SOC (from sensor.target_soc_tonight) into
+#      input_number.locked_target_soc — so the target doesn't drift overnight
+#      as the forecast updates.
+#   2. Waits 2 seconds for the helper write to propagate.
+#   3. If energy_deficit > 0.5 kWh AND real grid voltage confirmed (>210 V):
+#        → turns the breaker ON, sends Telegram notification with details.
+#      Otherwise:
+#        → sends Telegram notification "no charge needed" with surplus info.
+#
+# The 210 V voltage check is essential — cheap Zigbee breakers emit phantom
+# voltage readings (10–175 V) when physically de-energised by an upstream
+# voltage protection relay. Without this check, the automation would attempt
+# to turn on a dead chip and believe charging is in progress when it isn't.
+# See docs/phantom_voltage.md for full analysis.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.target_soc_tonight       → your target SOC template sensor (%)
+#   input_number.locked_target_soc  → helper number (written here, read by B and E)
+#   sensor.energy_deficit           → your energy deficit template sensor (kWh)
+#   sensor.breaker_voltage          → voltage sensor on the smart breaker (V)
+#   switch.grid_switch              → your smart breaker switch entity
+#   sensor.battery_soc_effective    → BMS SOC sensor — must go unavailable, not stale
+#   input_number.battery_capacity_kwh → usable battery capacity in kWh
+#   sensor.grid_energy_deficit_info → informational daily deficit sensor (optional)
+#   sensor.pv_forecast_tomorrow     → Solcast tomorrow entity
+#   sensor.energy_production_tomorrow → Open-Meteo Solar Forecast tomorrow entity
+#   sensor.avg_load_7d              → 7-day average daily load sensor (optional)
+#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+
+alias: "EMS: Lock target & start night charge (A)"
+description: >
+  v2.6 — fires at 23:05. Locks target SOC into helper, turns breaker on if
+  energy_deficit > 0.5 kWh AND breaker voltage > 210 V (real grid present).
+  Notifications go to Telegram. Voltage check prevents commanding a dead chip
+  when upstream voltage relay has cut the grid.
+
+triggers:
+  - trigger: time
+    at: "23:05:00"
+
+conditions: []
+
+actions:
+  # Step 1: snapshot target SOC so it doesn't drift overnight
+  - action: input_number.set_value
+    target:
+      entity_id: input_number.locked_target_soc
+    data:
+      value: "{{ states('sensor.target_soc_tonight') | int(20) }}"
+
+  # Step 2: wait for helper write to propagate
+  - delay:
+      seconds: 2
+
+  # Step 3: decide
+  - choose:
+      - alias: "Battery won't last — turn breaker on"
+        conditions:
+          - condition: numeric_state
+            entity_id: sensor.energy_deficit
+            above: 0.5
+          - condition: numeric_state
+            entity_id: sensor.breaker_voltage
+            above: 210
+            alias: "Real grid present (>210 V, not phantom voltage)"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                🔌 *EMS: Breaker ON — 23:05*
+                SOC: {{ states('sensor.battery_soc_effective') }}%
+                ({{ (states('sensor.battery_soc_effective') | float(0) / 100
+                  * states('input_number.battery_capacity_kwh') | float(13.3))
+                  | round(1) }} kWh)
+                | Target: {{ states('input_number.locked_target_soc') | int }}%
+                | Need: +{{ states('sensor.energy_deficit') }} kWh
+                Forecast deficit: {{ states('sensor.grid_energy_deficit_info') }} kWh
+                | Open-Meteo: {{ states('sensor.energy_production_tomorrow') | float | round(1) }} kWh
+                | Solcast: {{ states('sensor.pv_forecast_tomorrow') | float | round(1) }} kWh
+                Avg load 7d: {{ states('sensor.avg_load_7d') }} kWh
+
+    default:
+      - action: notify.send_message
+        target:
+          entity_id: notify.YOUR_TELEGRAM_BOT
+        data:
+          message: >
+            ✅ *EMS: No charge needed — 23:05*
+            SOC: {{ states('sensor.battery_soc_effective') }}%
+            ({{ (states('sensor.battery_soc_effective') | float(0) / 100
+              * states('input_number.battery_capacity_kwh') | float(13.3))
+              | round(1) }} kWh)
+            | Need: {{ states('sensor.energy_deficit') }} kWh
+            | Surplus: +{{ ((states('sensor.battery_soc_effective') | float(0) / 100
+              * states('input_number.battery_capacity_kwh') | float(13.3))
+              - (states('sensor.target_soc_tonight') | float(20) / 100
+              * states('input_number.battery_capacity_kwh') | float(13.3)))
+              | round(2) }} kWh
+            Forecast deficit: {{ states('sensor.grid_energy_deficit_info') }} kWh
+            | Open-Meteo: {{ states('sensor.energy_production_tomorrow') | float | round(1) }}
+            | Solcast: {{ states('sensor.pv_forecast_tomorrow') | float | round(1) }} kWh
+
+mode: single
