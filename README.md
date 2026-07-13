@@ -58,6 +58,7 @@ accepted known risks are documented in [`docs/model.md`](docs/model.md).
 | **C** | Emergency night correction | `energy_deficit` crosses 0.7 / 0.3 kWh | Reacts to reality diverging from forecast mid-night. Turns breaker on if deficit climbs above 0.7 kWh for 2 minutes; turns it off if deficit drops below 0.3 kWh. Hysteresis prevents oscillation. `mode: restart` so a fresh trigger always wins. |
 | **D** | Morning safety off | Time 06:58 | Unconditional `switch.turn_off`, no conditions, no notification. This is the layer that *must* work even if everything else is broken. |
 | **E** | Grid recovery | Breaker voltage > 210 V for 2 min | Handles the case where the grid disappeared and came back. Four branches: resume charging (night + deficit), confirm target already reached (night + SOC ok), force off (daytime — avoid paying peak tariff), emergency on (battery critically low regardless of time). |
+| **F** | Recovery after HA restart | Home Assistant `start` event | If HA itself restarts mid-night, none of A/C/E's triggers fire retroactively. After a 120 s delay (for the BMS and load-history helper to come up), turns the breaker on if it's off despite `energy_deficit > 0.5 kWh`. Local notification only (persistent_notification, not Telegram). |
 
 ---
 
@@ -128,6 +129,27 @@ minutes before acting — not just a non-zero reading.
 nothing restarts and the grid never blinks is essentially unfinished. Automation
 E exists because real-world grids do both.
 
+**Recovery from *your own* restart is not optional either.** A grid outage
+isn't the only thing that can silently break the night's automations — HA
+itself restarting mid-night (update, crash, add-on reload) makes every
+time-based and threshold-based trigger miss its window just as thoroughly.
+Automation F re-checks state on `homeassistant: start` for the same reason
+automation E re-checks it on grid recovery.
+
+**Scale a static profile with a live signal instead of hand-editing it.** The
+load profile table is a frozen snapshot that goes stale. Rather than
+periodically re-exporting and replacing it, a single live ratio (7-day actual
+average ÷ season's static total, clamped to a sane range) keeps the whole
+table roughly current without turning it into something that needs ongoing
+manual maintenance.
+
+**A percentile forecast is a cheap safety margin, if the source offers one.**
+Solcast's P10 (10th-percentile, pessimistic) estimate costs nothing extra to
+read but is normally ignored in favor of the median (P50) forecast. Blending
+in a configurable fraction of P10 buys protection against cloudy-day
+underperformance for free — the same idea behind Predbat's
+`weather_forecast_pv_quantile_bias`.
+
 ---
 
 ## Installation
@@ -151,6 +173,7 @@ Before importing automations, create these in
 | `input_number.battery_capacity_kwh` | Number | Usable battery capacity in kWh |
 | `input_number.minimum_soc_floor` | Number | Minimum SOC % you want at dawn |
 | `input_number.locked_target_soc` | Number | Written by automation A — do not edit manually |
+| `input_number.solcast_p10_bias` | Number (0–1) | Blend weight toward Solcast's pessimistic P10 forecast — default 0.3 |
 
 ### Entity ID mapping
 
@@ -163,6 +186,7 @@ All entity IDs in this repo use generic names. Map them to your actual entities:
 | `sensor.battery_soc_effective` | Your BMS SOC sensor (must go `unavailable`, not stale) |
 | `sensor.pv_forecast_today/tomorrow` | Solcast entities |
 | `sensor.energy_production_today/tomorrow` | Open-Meteo Solar Forecast entities |
+| `sensor.avg_load_7d` | A 7-day rolling average daily load — e.g. a Statistics helper (`state_characteristic: change`, `max_age: 7 days`) on your inverter-output energy sensor. Drives the live load correction (see `docs/model.md`) |
 | `notify.YOUR_TELEGRAM_BOT` | Your Telegram notify entity |
 
 ### Load profile
@@ -170,7 +194,10 @@ All entity IDs in this repo use generic names. Map them to your actual entities:
 The `load_profile_by_season` dict in the sensor templates is built from one
 specific household's data. **It will not match your house.** Export your own
 hourly consumption averages from your energy monitoring tool and replace the
-values before deploying.
+values before deploying. If you replace it, also update `season_daily_totals`
+(the daily kWh sum per season) — it feeds the live load-correction factor
+described in `docs/model.md`, and the two will silently disagree if only one
+is updated.
 
 ---
 

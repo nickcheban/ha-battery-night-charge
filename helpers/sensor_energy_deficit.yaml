@@ -11,7 +11,9 @@
 #
 # Algorithm:
 #   Walk hours [current_hour → 11] in night order.
-#   For each hour: gen = min(solcast, open_meteo). Load = profile[season][hour].
+#   For each hour: gen = blend(Solcast P50/P10, Open-Meteo), taking the
+#     conservative of the two sources. Load = profile[season][hour] * a
+#     live correction factor (see below).
 #   Accumulate deficit. Stop when gen ≥ load two hours in a row.
 #   target_need = deficit / eta + floor + reserve
 #   result = max(target_need - current_energy, 0)
@@ -31,9 +33,31 @@
 #   actual hourly mean consumption in Watts before deploying.
 #   See docs/model.md for methodology.
 #
+# Live load correction:
+#   The static table above goes stale as household consumption drifts.
+#   load_correction compares a live 7-day rolling average (sensor.avg_load_7d)
+#   against the season's static daily total and scales the whole hourly
+#   profile by the ratio — clamped to [0.7, 1.8] so a single bad reading (or
+#   the helper not having enough history yet) can't send the profile wild.
+#   season_daily_totals must be kept in sync with load_profile_by_season —
+#   it's just the sum of that table's hourly values, in kWh/day.
+#
+# Solcast P10/P50 blending:
+#   Solcast exposes both a median forecast (pv_estimate, P50) and a
+#   pessimistic 10th-percentile forecast (pv_estimate10, P10 — "10% chance
+#   generation is this low or lower"). Blending a fraction of P10 into the
+#   Solcast side of the min() adds a safety margin against cloudy-day
+#   underperformance, independent of the existing Open-Meteo/Solcast min().
+#   input_number.solcast_p10_bias (0–1) controls the blend weight; 0 = pure
+#   P50, 1 = pure P10. This does not replace the min(Solcast, Open-Meteo)
+#   logic — it only makes the Solcast side of that comparison more
+#   conservative before the min() is taken.
+#
 # Entity ID mapping (replace with your own):
 #   input_number.battery_capacity_kwh  → usable battery capacity in kWh
 #   input_number.minimum_soc_floor     → minimum SOC % you want at dawn
+#   input_number.solcast_p10_bias      → 0–1 blend weight toward Solcast P10
+#   sensor.avg_load_7d                 → 7-day rolling average daily load (kWh)
 #   sensor.battery_soc_effective       → BMS SOC sensor (must go unavailable)
 #   sensor.energy_production_today/tomorrow   → Open-Meteo Solar Forecast
 #   sensor.pv_forecast_today/tomorrow  → Solcast integration entities
@@ -66,6 +90,16 @@ state: >
                    22:678,23:643}
   } %}
   {% set load_profile = load_profile_by_season[season] %}
+
+  {# ── Live load correction ──────────────────────────────────────────────── #}
+  {# season_daily_totals must equal the sum of the hourly values above for   #}
+  {# each season (kWh/day) — keep both in sync when you replace either.     #}
+  {% set season_daily_totals = {'winter': 17.378, 'transition': 17.378, 'summer': 16.656} %}
+  {% set live_avg_load = states('sensor.avg_load_7d') | float(0) %}
+  {% set season_total = season_daily_totals[season] %}
+  {% set load_correction_raw = (live_avg_load / season_total)
+                               if (live_avg_load > 5 and season_total > 0) else 1 %}
+  {% set load_correction = [[load_correction_raw, 0.7] | max, 1.8] | min %}
 
   {# ── Forecast data ────────────────────────────────────────────────────── #}
   {% set om_today    = state_attr('sensor.energy_production_today', 'wh_period') or {} %}
@@ -109,8 +143,13 @@ state: >
       {% set om_wh  = om_map.get(om_key, 0) | float(0) %}
       {% set sc_match = sc_list | selectattr('period_start.hour', 'eq', h) | list %}
       {% set sc_present = sc_match | count > 0 %}
-      {% set sc_wh  = (sc_match[0].pv_estimate | float(0)) * 1000
-                      if sc_present else 0 %}
+
+      {# Blend Solcast P50 (median) with P10 (pessimistic) before the min(). #}
+      {% set p10_bias = states('input_number.solcast_p10_bias') | float(0.3) %}
+      {% set sc_p50 = (sc_match[0].pv_estimate | float(0)) if sc_present else 0 %}
+      {% set sc_p10 = (sc_match[0].pv_estimate10 | float(sc_p50)) if sc_present else 0 %}
+      {% set sc_kwh = sc_p50 * (1 - p10_bias) + sc_p10 * p10_bias %}
+      {% set sc_wh  = sc_kwh * 1000 %}
 
       {# Use presence of a data point, not a magnitude threshold, to decide  #}
       {# whether a source counts — a genuine low-but-nonzero forecast (e.g. #}
@@ -121,7 +160,7 @@ state: >
       {% if om_present %}{% set candidates = candidates + [om_wh] %}{% endif %}
       {% if sc_present %}{% set candidates = candidates + [sc_wh] %}{% endif %}
       {% set gen_wh  = candidates | min if candidates | count > 0 else 0 %}
-      {% set load_wh = load_profile[h] %}
+      {% set load_wh = load_profile[h] * load_correction %}
       {% set gen_ge  = gen_wh >= load_wh %}
 
       {% set ns.deficit_wh = ns.deficit_wh + [load_wh - gen_wh, 0] | max %}

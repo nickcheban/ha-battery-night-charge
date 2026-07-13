@@ -13,8 +13,10 @@
 # During daytime (outside the night window 23:00–11:59), returns the
 # safety floor % rather than 0, so dashboards always show a meaningful value.
 #
-# Contains identical forecast/profile logic as sensor_energy_deficit.yaml.
-# If you update the load profile in one, update the other.
+# Contains identical forecast/profile logic as sensor_energy_deficit.yaml,
+# including the live load correction and Solcast P10/P50 blend — see that
+# file's header for the rationale. If you update the load profile, the
+# correction factor, or the P10 blend in one, update the other.
 #
 # How to install:
 #   Settings → Devices & Services → Helpers → Create Helper → Template sensor
@@ -47,6 +49,14 @@ state: >
                    22:678,23:643}
   } %}
   {% set load_profile = load_profile_by_season[season] %}
+
+  {# ── Live load correction — see sensor_energy_deficit.yaml for rationale #}
+  {% set season_daily_totals = {'winter': 17.378, 'transition': 17.378, 'summer': 16.656} %}
+  {% set live_avg_load = states('sensor.avg_load_7d') | float(0) %}
+  {% set season_total = season_daily_totals[season] %}
+  {% set load_correction_raw = (live_avg_load / season_total)
+                               if (live_avg_load > 5 and season_total > 0) else 1 %}
+  {% set load_correction = [[load_correction_raw, 0.7] | max, 1.8] | min %}
 
   {% set om_today    = state_attr('sensor.energy_production_today', 'wh_period') or {} %}
   {% set om_tomorrow = state_attr('sensor.energy_production_tomorrow', 'wh_period') or {} %}
@@ -83,15 +93,20 @@ state: >
       {% set om_wh  = om_map.get(om_key, 0) | float(0) %}
       {% set sc_match = sc_list | selectattr('period_start.hour', 'eq', h) | list %}
       {% set sc_present = sc_match | count > 0 %}
-      {% set sc_wh  = (sc_match[0].pv_estimate | float(0)) * 1000
-                      if sc_present else 0 %}
+
+      {% set p10_bias = states('input_number.solcast_p10_bias') | float(0.3) %}
+      {% set sc_p50 = (sc_match[0].pv_estimate | float(0)) if sc_present else 0 %}
+      {% set sc_p10 = (sc_match[0].pv_estimate10 | float(sc_p50)) if sc_present else 0 %}
+      {% set sc_kwh = sc_p50 * (1 - p10_bias) + sc_p10 * p10_bias %}
+      {% set sc_wh  = sc_kwh * 1000 %}
+
       {# Use presence of a data point, not a magnitude threshold — a genuine #}
       {# low-but-nonzero forecast must still be eligible for the min().     #}
       {% set candidates = [] %}
       {% if om_present %}{% set candidates = candidates + [om_wh] %}{% endif %}
       {% if sc_present %}{% set candidates = candidates + [sc_wh] %}{% endif %}
       {% set gen_wh  = candidates | min if candidates | count > 0 else 0 %}
-      {% set load_wh = load_profile[h] %}
+      {% set load_wh = load_profile[h] * load_correction %}
       {% set gen_ge  = gen_wh >= load_wh %}
       {% set ns.deficit_wh = ns.deficit_wh + [load_wh - gen_wh, 0] | max %}
       {% if gen_ge and ns.prev_gen_ge %}

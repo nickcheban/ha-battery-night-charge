@@ -98,3 +98,11 @@ that is wrong on the night itself (predicts "good morning" but reality is
 
 This is the primary reason a forecast-error buffer remains an open question
 rather than a settled decision (see `docs/model.md`).
+
+**Note:** the Solcast P10/P50 blend and the live load-correction factor
+(see `docs/model.md`) were added after these backtests were run. Neither
+pass above exercises them — both passes use recorded generation directly as
+the forecast stand-in (bypassing Solcast/Open-Meteo entirely) and a static
+load profile without the correction factor applied. Re-running Pass 1 with
+these two mechanisms enabled is a reasonable next validation step, not yet
+done.

@@ -1,0 +1,89 @@
+# Automation F: Recovery after Home Assistant restart
+# =====================================================
+# Fires on Home Assistant startup. Waits 2 minutes for the BMS and the
+# 7-day load Statistics helper to report valid readings, then checks
+# whether the breaker should be on but isn't — e.g. HA restarted mid-night
+# (update, crash, add-on restart) and missed the window during which
+# automation A, C, or E would otherwise have turned it on.
+#
+# Why this is necessary:
+#   Automations A, C and E only run on discrete triggers (a specific time,
+#   a sensor crossing a threshold, a voltage recovery). None of those
+#   triggers fire retroactively after HA restarts. Without this automation,
+#   the breaker would silently stay off for the rest of the night even
+#   though energy_deficit correctly reports a need to charge.
+#
+# Design decisions:
+#
+#   120 second delay
+#     On HA startup, the BMS integration and the 7-day load Statistics
+#     helper both take time to produce their first valid reading. Acting
+#     before they're ready risks reading stale or default values.
+#
+#   sensor.avg_load_7d > 5 sanity check
+#     Guards against acting when the Statistics helper hasn't accumulated
+#     real history yet (e.g. right after first install, or after the
+#     helper was recreated) — its default/empty state should not be read
+#     as "zero load".
+#
+#   persistent_notification, not Telegram
+#     This fires rarely, right after a restart, when Telegram delivery
+#     could plausibly not have caught up yet. Local visibility is enough.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.battery_soc_effective    → BMS SOC sensor
+#   sensor.avg_load_7d              → 7-day average daily load sensor
+#   sensor.energy_deficit           → energy deficit template sensor (kWh)
+#   switch.grid_switch              → your smart breaker switch entity
+
+alias: "EMS: Recovery after HA restart (F)"
+description: >
+  v2.3 — if HA restarts mid-night and the breaker is off despite
+  energy_deficit > 0.5 kWh, turns it on. 120 s delay lets the BMS and the
+  7-day load Statistics helper come up before acting.
+
+triggers:
+  - trigger: homeassistant
+    event: start
+
+conditions: []
+
+actions:
+  - delay:
+      seconds: 120
+
+  - choose:
+      - alias: "Night, SOC valid, load history valid, charge needed"
+        conditions:
+          - condition: time
+            after: "23:05:00"
+            before: "06:57:00"
+          - alias: "SOC valid"
+            condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.battery_soc_effective
+                state: "unavailable"
+          - alias: "Load-history helper has real data"
+            condition: numeric_state
+            entity_id: sensor.avg_load_7d
+            above: 5
+          - condition: numeric_state
+            entity_id: sensor.energy_deficit
+            above: 0.5
+          - condition: state
+            entity_id: switch.grid_switch
+            state: "off"
+        sequence:
+          - action: switch.turn_on
+            target:
+              entity_id: switch.grid_switch
+          - action: notify.persistent_notification
+            data:
+              title: "EMS: Recovery after HA restart"
+              message: >
+                HA restarted. Breaker restored.
+                SOC: {{ states('sensor.battery_soc_effective') }}%
+                | Need: {{ states('sensor.energy_deficit') }} kWh
+
+mode: single
