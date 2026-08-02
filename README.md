@@ -8,8 +8,10 @@ throughout the night based on an hourly solar generation forecast.
 > repository were developed iteratively in partnership with
 > [Claude](https://claude.ai) (Anthropic). The AI helped analyse real historical
 > sensor data from InfluxDB, identify edge cases, write and validate Jinja2
-> templates, and run backtests against ~110 days of recorded data before any
-> automation went live.
+> templates, run backtests against ~110 days of recorded data before any
+> automation went live, and later diagnose a real production flapping
+> incident from history and trace data (see
+> [`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md)).
 
 ---
 
@@ -27,6 +29,26 @@ recalculates that answer dynamically throughout the night.
 
 ---
 
+## Hardware context
+
+- Hybrid inverter, 11 kW, dual independent MPPT inputs (5.5 kW each)
+- Two PV arrays, one per MPPT tracker, on deliberately different azimuths so
+  each catches a different part of the day instead of one compromise-angle
+  array — roughly 180° apart (e.g. one biased toward morning sun, one toward
+  afternoon sun), same tilt
+- LiFePO4 battery pack with a BMS exposing SOC
+- A Zigbee/WiFi smart relay as the grid breaker — see
+  [the phantom voltage problem](#the-phantom-voltage-problem) below for why
+  a cheap relay like this needs special handling
+
+The dual-array setup is not load-bearing for the model's *logic* — see
+[`docs/model.md`](docs/model.md#two-pv-arrays-on-independent-mppt-inputs) for
+exactly what changes (forecast summing) and what doesn't (everything else).
+If you only have one array, the model collapses back to its original
+single-source form.
+
+---
+
 ## How the decision is made
 
 At 23:05, a template sensor walks hour-by-hour from the current hour through
@@ -38,13 +60,16 @@ confirmed (>210 V for 2 minutes), the breaker turns on.
 
 **Forecast source:** `min(Solcast hourly, Open-Meteo hourly)` per hour — the
 more conservative of two independent sources, chosen to reduce the chance of a
-single bad forecast leaving the battery flat.
+single bad forecast leaving the battery flat. On the Open-Meteo side, if you
+have two PV arrays on separate azimuths, their forecasts are summed before
+this comparison (see Hardware context above).
 
 **Load profile:** a static hourly table built from ~110 days of real household
-consumption data, split into three seasons (winter/transition/summer). Replace
-with your own data.
+consumption data, split into three seasons (winter/transition/summer), scaled
+by a live 7-day-average correction factor so it doesn't go stale. Replace the
+base table with your own data.
 
-Full design rationale, two bugs found and fixed during development, and
+Full design rationale, bugs found and fixed during development, and
 accepted known risks are documented in [`docs/model.md`](docs/model.md).
 
 ---
@@ -55,7 +80,7 @@ accepted known risks are documented in [`docs/model.md`](docs/model.md).
 |----|-------|---------|--------------|
 | **A** | Lock target & start charge | Time 23:05 | Snapshots the current target SOC into a helper (so it doesn't drift overnight), then turns the breaker on if `energy_deficit > 0.5 kWh` AND real grid voltage confirmed (`>210 V`). Sends Telegram summary either way. |
 | **B** | Off — target reached | SOC state change, `for: 30s` | Watches SOC all night; turns breaker off when SOC ≥ `min(target+2%, 95%)` stable for 30 seconds. The 30 s debounce is intentional — BMS units commonly flap to `unknown` during charging, making longer windows unreliable. |
-| **C** | Emergency night correction | `energy_deficit` crosses 0.7 / 0.3 kWh | Reacts to reality diverging from forecast mid-night. Turns breaker on if deficit climbs above 0.7 kWh for 2 minutes; turns it off if deficit drops below 0.3 kWh. Hysteresis prevents oscillation. `mode: restart` so a fresh trigger always wins. |
+| **C** | Emergency night correction | `energy_deficit` crosses 0.7 / 0.3 kWh | Reacts to reality diverging from forecast mid-night. **v2.7** — turns breaker on if deficit climbs above 0.7 kWh for 2 minutes (and breaker's been off ≥30 min); turns it off if deficit drops below 0.3 kWh for 2 minutes (and breaker's been on ≥30 min). Symmetric debounce + symmetric minimum-runtime guard on both directions, fixing a real multi-cycle flapping incident — see [`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md). `mode: restart` so a fresh trigger always wins. |
 | **D** | Morning safety off | Time 06:58 | Unconditional `switch.turn_off`, no conditions, no notification. This is the layer that *must* work even if everything else is broken. |
 | **E** | Grid recovery | Breaker voltage > 210 V for 2 min | Handles the case where the grid disappeared and came back. Four branches: resume charging (night + deficit), confirm target already reached (night + SOC ok), force off (daytime — avoid paying peak tariff), emergency on (battery critically low regardless of time). |
 | **F** | Recovery after HA restart | Home Assistant `start` event | If HA itself restarts mid-night, none of A/C/E's triggers fire retroactively. After a 120 s delay (for the BMS and load-history helper to come up), turns the breaker on if it's off despite `energy_deficit > 0.5 kWh`. Local notification only (persistent_notification, not Telegram). |
@@ -99,6 +124,20 @@ Full methodology and results: [`docs/backtest.md`](docs/backtest.md).
 
 ---
 
+## A real production incident, diagnosed and fixed
+
+After the inverter/dual-array upgrade, one night produced 5 breaker on/off
+cycles, including a 3-second flap. This is documented end-to-end — symptom,
+diagnosis method (including where automation trace retention got in the way),
+root cause, and the v2.7 fix — in
+[`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md). It's
+a fairly generic short-cycling problem and the fix follows standard Home
+Assistant community patterns (symmetric debounce + a `min_cycle_duration`-
+style guard), so it's included here as a worked example even if your setup
+never hits this exact bug.
+
+---
+
 ## Design patterns worth stealing
 
 **Snapshot the decision, don't chase a moving target.** The target SOC is
@@ -111,10 +150,12 @@ deliberately has zero conditions. It turns the breaker off at 06:58 every
 morning, full stop. This is the layer that works even if every other automation
 is broken, the BMS is unavailable, or the forecast API is down.
 
-**Debounce real hardware.** BMS units commonly report SOC as `unknown` for
-~35 seconds during active charging. A `for: 2 minutes` trigger window will
-almost never fire. `for: 30s` is the right balance — long enough to ignore
-transient flaps, short enough to catch the actual target.
+**Debounce real hardware — symmetrically.** BMS units commonly report SOC as
+`unknown` for ~35 seconds during active charging. A `for: 2 minutes` trigger
+window will almost never fire; `for: 30s` is the right balance. And when a
+value oscillates around a hysteresis band (not just a single threshold),
+debounce *both* sides of the band the same way — an asymmetric debounce is
+exactly what caused the incident above.
 
 **Two independent forecast sources, combined pessimistically.** Relying on one
 weather API is a single point of failure for the most important input. Taking
@@ -160,7 +201,7 @@ underperformance for free — the same idea behind Predbat's
 - LiFePO4 battery with a BMS that exposes SOC — must resolve to
   `unavailable`/`unknown` (not a stale number) when the BMS is unreachable
 - [Solcast](https://github.com/BJReplay/ha-solcast-solar) integration
-- [Open-Meteo Solar Forecast](https://www.home-assistant.io/integrations/open_meteo_solar_forecast/) integration
+- [Open-Meteo Solar Forecast](https://www.home-assistant.io/integrations/open_meteo_solar_forecast/) integration (one entry per PV array, if you have more than one)
 - Telegram bot configured in Home Assistant (`notify.send_message` service)
 
 ### Helpers to create
@@ -185,7 +226,8 @@ All entity IDs in this repo use generic names. Map them to your actual entities:
 | `sensor.breaker_voltage` | Voltage sensor on the breaker |
 | `sensor.battery_soc_effective` | Your BMS SOC sensor (must go `unavailable`, not stale) |
 | `sensor.pv_forecast_today/tomorrow` | Solcast entities |
-| `sensor.energy_production_today/tomorrow` | Open-Meteo Solar Forecast entities |
+| `sensor.energy_production_today/tomorrow` | Open-Meteo Solar Forecast entities — PV array 1 |
+| `sensor.energy_production_today/tomorrow_array2` | Open-Meteo Solar Forecast entities — PV array 2 (omit if you only have one array; see `docs/model.md`) |
 | `sensor.avg_load_7d` | A 7-day rolling average daily load — e.g. a Statistics helper (`state_characteristic: change`, `max_age: 7 days`) on your inverter-output energy sensor. Drives the live load correction (see `docs/model.md`) |
 | `notify.YOUR_TELEGRAM_BOT` | Your Telegram notify entity |
 

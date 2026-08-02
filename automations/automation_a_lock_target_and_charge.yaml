@@ -111,3 +111,5 @@ actions:
             | Solcast: {{ states('sensor.pv_forecast_tomorrow') | float | round(1) }} kWh
 
 mode: single
+trace:
+  stored_traces: 30

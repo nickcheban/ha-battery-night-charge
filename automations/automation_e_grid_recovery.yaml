@@ -24,14 +24,10 @@
 #     → breaker came back on via "restore previous state" but target is met;
 #        turn it off to stop over-charging
 #
-#   Branch 3 — Daytime (06:58–23:01) → force OFF
+#   Branch 3 — Daytime (06:58–23:04) → force OFF
 #     Breaker on during peak tariff hours → turn off unconditionally
 #     Handles the scenario where the breaker returned from "restore" as ON
 #     during daytime, which would charge from expensive peak electricity
-#     Ends at 23:01 (not 23:04) to exactly match the start of the night
-#     window in branches 1/2 — an earlier version left a 3-minute overlap
-#     (23:01–23:04) where both this branch and the night branches could
-#     match simultaneously.
 #
 #   Branch 4 — Battery critically low → turn ON any time
 #     Battery voltage < 49 V regardless of time or tariff
@@ -132,12 +128,12 @@ actions:
                 SOC: {{ states('sensor.battery_soc_effective') }}%
                 ≥ target {{ states('input_number.locked_target_soc') | int }}% + 2%
 
-      # Branch 3: Daytime (06:58–23:01) → force breaker OFF unconditionally
+      # Branch 3: Daytime (06:58–23:04) → force breaker OFF unconditionally
       - alias: "Daytime → force off"
         conditions:
           - condition: time
             after: "06:58:00"
-            before: "23:01:00"
+            before: "23:04:00"
           - condition: state
             entity_id: switch.grid_switch
             state: "on"
@@ -178,3 +174,5 @@ actions:
                 Breaker turned on regardless of time or tariff.
 
 mode: single
+trace:
+  stored_traces: 30

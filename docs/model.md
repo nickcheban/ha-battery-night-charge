@@ -82,6 +82,29 @@ ISO timestamp key in *both* entities, rather than picking one by name. This is
 deferred — the edge case window is narrow (~5 minutes) and the consequences
 are bounded (one re-evaluation might use slightly stale data).
 
+## Two PV arrays on independent MPPT inputs
+
+The system originally had a single PV array feeding one inverter's single
+MPPT tracker. After a hardware upgrade to a larger, dual-MPPT inverter, a
+second array was added on a different azimuth — deliberately close to the
+opposite orientation of the first (one biased toward morning sun, the other
+toward afternoon sun), so each MPPT tracks its own array independently
+instead of one compromise-angle array trying to do both.
+
+This changes the shape of the generation curve (flatter, wider peak instead
+of one sharp midday peak) but not the model's logic: Open-Meteo has no
+native concept of "multiple orientations per entry," so the second array is
+registered as a second integration entry, and its `wh_period` forecast is
+simply summed with the first array's, hour by hour, before the
+`min(Open-Meteo, Solcast)` comparison. Solcast needs no equivalent change —
+it natively aggregates multiple rooftop resources into one forecast per
+integration entry, so a second array there is just a second resource in the
+same integration config, not a second set of entities.
+
+If you only have one array, this collapses back to the original single-source
+form — see the comments in `helpers/sensor_energy_deficit.yaml` for the exact
+lines to remove.
+
 ## Parameters
 
 | Parameter | Value | Notes |
@@ -123,12 +146,6 @@ having accumulated 7 days of history yet — can't scale the whole profile to
 an extreme value. `season_daily_totals` must be kept equal to the sum of
 `load_profile_by_season[season]` for each season; if you replace the hourly
 table with your own data, recompute this total too.
-
-This directly addresses the "rolling load profile" item that was previously
-listed under Open questions below — it is not a true rolling average of the
-table itself, but a live correction factor applied on top of it, which was
-judged simpler and safer to reason about than continuously rewriting the
-table.
 
 ### Solcast P10/P50 blending
 
@@ -181,3 +198,8 @@ deploying. These numbers are specific to one home and will not transfer.
   drift unchecked. Replacing the table's *shape* (not just its overall scale)
   would require an actual rolling-average rebuild of the hourly table, which
   is not implemented.
+- **Second array's own Solcast P10/P50 characteristics not modeled
+  separately.** Both arrays share one `solcast_p10_bias` blend weight even
+  though they're two different orientations with potentially different
+  cloud-sensitivity profiles. Not addressed — the effect is expected to be
+  second-order compared to the existing conservative `min()` step.

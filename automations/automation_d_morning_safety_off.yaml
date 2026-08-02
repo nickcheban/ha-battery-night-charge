@@ -37,3 +37,5 @@ actions:
       entity_id: switch.grid_switch
 
 mode: single
+trace:
+  stored_traces: 30

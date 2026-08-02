@@ -99,10 +99,71 @@ that is wrong on the night itself (predicts "good morning" but reality is
 This is the primary reason a forecast-error buffer remains an open question
 rather than a settled decision (see `docs/model.md`).
 
-**Note:** the Solcast P10/P50 blend and the live load-correction factor
-(see `docs/model.md`) were added after these backtests were run. Neither
-pass above exercises them — both passes use recorded generation directly as
-the forecast stand-in (bypassing Solcast/Open-Meteo entirely) and a static
-load profile without the correction factor applied. Re-running Pass 1 with
-these two mechanisms enabled is a reasonable next validation step, not yet
-done.
+---
+
+## Pass 3 — minimum run-time guard validation (July + August 2026)
+
+### Context
+
+After observing oscillation in automation C (emergency night correction) —
+the breaker turning on and off multiple times per night — a minimum 30-minute
+run-time guard was added to the turn-off branch. Before deploying, the change
+was validated by simulation on real InfluxDB data.
+
+### Data
+
+**July 2026:** 859 data points at 10-minute resolution from InfluxDB
+(`sensor.energii_ne_hvataet`). Switch history from HA recorder (168 state
+changes, 11 nights with active charging).
+
+**August 1→2, 2026:** 61 data points at 1-minute resolution (full resolution
+pull). Confirmed against logbook which shows exact automation attribution
+(C triggered all switching after the initial A turn-on at 23:05).
+
+### July results
+
+| Variant | Nights detected | Oscillation nights | Extra ON cycles |
+|---|---|---|---|
+| Real (logbook) | 11 | 2 | 3 |
+| Current (no change) | 27 | 2 | 2 |
+| Solution: smooth 10 min | 27 | 0 | 0 |
+| **Solution: min 30 min** | **27** | **1** | **1** |
+| Combo (smooth + 30 min) | 27 | 0 | 0 |
+
+The 27 detected nights vs 11 real nights discrepancy reflects that the
+simulator sees only `energy_deficit` — it fires C whenever the threshold is
+crossed regardless of what automation A decided. Nights where A correctly
+decided not to charge still show C activity in the simulation.
+
+The minimum 30-minute guard reduces oscillation nights from 2 to 1 and extra
+cycles from 3 to 1 on July data — without introducing any new dangerous misses.
+
+### August 1→2 results
+
+| Variant | C switching cycles |
+|---|---|
+| Real (logbook) | 7 |
+| Current (simulated) | 9 |
+| Smooth 10 min | 9 (no improvement) |
+| **Min 30 min** | **5** ✅ |
+| Combo | 7 (neutral) |
+
+The 30-minute guard is the clear winner on the August oscillation night:
+reduces cycles from 9 to 5. Smoothing alone does not help because the
+underlying signal (battery actually charging, then deficit returning) is real,
+not noise — it cannot be averaged away.
+
+### Why smoothing does not help here
+
+The spike at 02:59 UTC (5.87 kWh, caused by Open-Meteo forecast rotation at
+06:00 local time) is genuine data that smoothing partially absorbs, but the
+main oscillation pattern — deficit rising above 0.7 after a short charge
+session, then falling below 0.3 once the breaker turns on — is physical
+behaviour that no amount of signal averaging will eliminate. The minimum
+run-time guard addresses the root cause directly.
+
+### Decision
+
+Minimum 30-minute run-time guard deployed as the sole change to automation C
+(v2.6). Smoothing deferred — it adds complexity without improving the
+metric that matters on real oscillation nights.

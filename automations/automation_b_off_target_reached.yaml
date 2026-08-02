@@ -75,3 +75,5 @@ actions:
         {{ states('input_number.locked_target_soc') | int }}% + 2% buffer
 
 mode: single
+trace:
+  stored_traces: 30

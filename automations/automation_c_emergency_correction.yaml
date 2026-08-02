@@ -5,7 +5,7 @@
 #
 # Two triggers:
 #   need_charge: energy_deficit rises above 0.7 kWh for 2 minutes → turn ON
-#   stop_charge: energy_deficit falls below 0.3 kWh              → turn OFF
+#   stop_charge: energy_deficit falls below 0.3 kWh for 2 minutes → turn OFF
 #
 # Hysteresis (0.7 on / 0.3 off) prevents oscillation — the breaker won't
 # flicker on/off if the deficit hovers near a single threshold.
@@ -14,13 +14,44 @@
 # run still resolving its sequence (e.g. a new need_charge trigger cancels
 # a stop_charge that was in progress).
 #
-# Design decisions:
+# ── v2.7 — real-world anti-flapping fix ──────────────────────────────────
+# A production night with a recently upgraded (larger) inverter produced 5
+# breaker on/off cycles, including one 3-second on→off flap. Root-caused to
+# two gaps in v2.6, both fixed here. Full incident writeup, including how it
+# was diagnosed from history + trace data:
+# docs/anti-flapping-case-study.md (EN) / .ru.md (RU).
 #
-#   for: 2 minutes on need_charge (not stop_charge)
-#     Two minutes of sustained deficit confirms the situation is real, not
-#     a transient BMS flap. No delay on stop_charge — there is no cost to
-#     turning off slightly early, but leaving the breaker on when it shouldn't
-#     be wastes grid electricity.
+# Design decisions (current, v2.7):
+#
+#   for: 2 minutes on BOTH need_charge and stop_charge (was: only need_charge)
+#     v2.6 debounced the turn-on trigger but not the turn-off trigger — a
+#     single noisy dip below 0.3 kWh fired turn-off instantly. This asymmetry
+#     is exactly the kind of thing that produces short cycling once the
+#     underlying sensor gets noisier (e.g. a bigger inverter reaches SOC
+#     thresholds faster, so more raw deficit ticks land near the boundary).
+#     Standard HA community guidance for a bouncing signal: debounce with
+#     `for:` — and debounce it the same way on both sides of a hysteresis
+#     band, not just one.
+#
+#   Native `for:` state condition — both directions (was: template + one
+#   direction only)
+#     v2.6 had a 30-minute minimum-runtime guard, but only on turn-off, and
+#     implemented as a `condition: template` doing manual
+#     `(now() - last_changed)` duration math. Two problems: (1) nothing
+#     stopped the breaker from being flipped back on within seconds of
+#     turning off, which is what actually produced the 3-second flap; (2)
+#     template duration math bypasses HA's config-load-time validation and
+#     fails silently at runtime, whereas a native `for:` on a `state`
+#     condition is schema-validated. This mirrors the same
+#     `min_cycle_duration` pattern HA's own `generic_thermostat` uses to
+#     protect compressors from short-cycling — applied here symmetrically to
+#     both the on and off branches.
+#
+#   Trade-off worth knowing: during the 30-minute post-flip cooldown, C
+#   will not react even to a real, sudden deficit spike. This is deliberate
+#   — automation A (23:05, the primary decision) and branch 4 of automation
+#   E (emergency on, battery <49V) are not gated by this cooldown and remain
+#   the safety net for genuinely urgent cases.
 #
 #   Voltage check on turn-on only
 #     The >210 V voltage check (real grid present) is applied to the turn-on
@@ -42,10 +73,11 @@
 
 alias: "EMS: Emergency night correction (C)"
 description: >
-  v2.5 — reacts to energy_deficit crossing 0.7 kWh (on) / 0.3 kWh (off)
-  during the night window 23:06–06:57. Hysteresis prevents oscillation.
-  Voltage >210 V check on turn-on. SOC validity check on turn-off prevents
-  false off when BMS flaps to unknown (which causes energy_deficit → 0).
+  v2.7 — symmetric debounce: for:2min added to stop_charge trigger (was
+  on need_charge only). Native for:30min state condition on the breaker
+  replaces the old template last_changed check, applied to BOTH the
+  turn-on and turn-off branches (was turn-off only). Fixes a real
+  multi-cycle flapping incident — see docs/anti-flapping-case-study.md.
 
 triggers:
   - trigger: numeric_state
@@ -57,6 +89,8 @@ triggers:
   - trigger: numeric_state
     entity_id: sensor.energy_deficit
     below: 0.3
+    for:
+      minutes: 2
     id: stop_charge
 
 conditions:
@@ -75,9 +109,12 @@ actions:
         conditions:
           - condition: trigger
             id: need_charge
-          - condition: state
+          - alias: "Breaker has been off for at least 30 minutes"
+            condition: state
             entity_id: switch.grid_switch
             state: "off"
+            for:
+              minutes: 30
           - condition: numeric_state
             entity_id: sensor.breaker_voltage
             above: 210
@@ -100,9 +137,12 @@ actions:
         conditions:
           - condition: trigger
             id: stop_charge
-          - condition: state
+          - alias: "Breaker has been on for at least 30 minutes"
+            condition: state
             entity_id: switch.grid_switch
             state: "on"
+            for:
+              minutes: 30
           - alias: "SOC valid before turning off"
             condition: template
             value_template: >
@@ -122,3 +162,6 @@ actions:
                 | SOC: {{ states('sensor.battery_soc_effective') }}%
 
 mode: restart
+
+trace:
+  stored_traces: 30
