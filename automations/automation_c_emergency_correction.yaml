@@ -4,80 +4,78 @@
 # case where reality diverges from the forecast mid-night.
 #
 # Two triggers:
-#   need_charge: energy_deficit rises above 0.7 kWh for 2 minutes → turn ON
-#   stop_charge: energy_deficit falls below 0.3 kWh for 2 minutes → turn OFF
+#   need_charge: energy_deficit rises above 0.7 kWh for 2 minutes → grid-charge mode
+#   stop_charge: energy_deficit falls below 0.3 kWh for 2 minutes → autonomous mode
 #
-# Hysteresis (0.7 on / 0.3 off) prevents oscillation — the breaker won't
-# flicker on/off if the deficit hovers near a single threshold.
+# Hysteresis (0.7 on / 0.3 off) prevents oscillation — the inverter won't
+# flip mode if the deficit hovers near a single threshold.
 #
 # mode: restart ensures a fresh trigger always takes priority over a previous
 # run still resolving its sequence (e.g. a new need_charge trigger cancels
 # a stop_charge that was in progress).
 #
-# ── v2.7 — real-world anti-flapping fix ──────────────────────────────────
+# ── v2.7 — real-world anti-flapping fix (breaker era) ────────────────────
 # A production night with a recently upgraded (larger) inverter produced 5
 # breaker on/off cycles, including one 3-second on→off flap. Root-caused to
-# two gaps in v2.6, both fixed here. Full incident writeup, including how it
-# was diagnosed from history + trace data:
+# two gaps in v2.6 (asymmetric debounce, asymmetric minimum-runtime guard),
+# both fixed in v2.7. Full incident writeup:
 # docs/anti-flapping-case-study.md (EN) / .ru.md (RU).
 #
-# Design decisions (current, v2.7):
+# ── v3.0 — architecture change: inverter mode switching, not breaker toggling ──
+# The v2.7 fix addressed the *symptom* (asymmetric debounce/guard). This
+# version addresses the underlying exposure: a physical grid breaker was
+# never a great actuator for "should the battery charge from grid right
+# now" in the first place — it's a mechanical relay with a finite cycle
+# life, being cycled on a decision that changes multiple times per night.
+# After a hardware upgrade gave independent inverter-side output/charge
+# priority selects, the breaker is now left permanently on, and this
+# automation switches inverter mode instead of a physical relay. The v2.7
+# debounce/guard logic (both the *why* and the *how*) still applies
+# unchanged — it just now protects a `select.select_option` call instead of
+# a `switch.turn_on/off` call. See docs/model.md#inverter-mode-switching.
 #
-#   for: 2 minutes on BOTH need_charge and stop_charge (was: only need_charge)
-#     v2.6 debounced the turn-on trigger but not the turn-off trigger — a
-#     single noisy dip below 0.3 kWh fired turn-off instantly. This asymmetry
-#     is exactly the kind of thing that produces short cycling once the
-#     underlying sensor gets noisier (e.g. a bigger inverter reaches SOC
-#     thresholds faster, so more raw deficit ticks land near the boundary).
-#     Standard HA community guidance for a bouncing signal: debounce with
-#     `for:` — and debounce it the same way on both sides of a hysteresis
-#     band, not just one.
+# Design decisions (current, v3.0 on top of v2.7):
 #
-#   Native `for:` state condition — both directions (was: template + one
-#   direction only)
-#     v2.6 had a 30-minute minimum-runtime guard, but only on turn-off, and
-#     implemented as a `condition: template` doing manual
-#     `(now() - last_changed)` duration math. Two problems: (1) nothing
-#     stopped the breaker from being flipped back on within seconds of
-#     turning off, which is what actually produced the 3-second flap; (2)
-#     template duration math bypasses HA's config-load-time validation and
-#     fails silently at runtime, whereas a native `for:` on a `state`
-#     condition is schema-validated. This mirrors the same
-#     `min_cycle_duration` pattern HA's own `generic_thermostat` uses to
-#     protect compressors from short-cycling — applied here symmetrically to
-#     both the on and off branches.
+#   for: 2 minutes on BOTH need_charge and stop_charge
+#     Symmetric debounce, unchanged rationale from v2.7 — a noisy dip near a
+#     hysteresis boundary shouldn't be able to flip the decision on its own.
+#
+#   Native `for:` state condition — both directions
+#     30-minute minimum-runtime guard applies to both the grid-charge and
+#     autonomous branches, implemented as a native `for:` on a `state`
+#     condition against the select entity (was: against the breaker switch
+#     entity pre-v3.0). Native form is schema-validated at config load.
+#     This mirrors the same `min_cycle_duration` pattern HA's own
+#     `generic_thermostat` uses to protect compressors from short-cycling.
 #
 #   Trade-off worth knowing: during the 30-minute post-flip cooldown, C
 #   will not react even to a real, sudden deficit spike. This is deliberate
 #   — automation A (23:05, the primary decision) and branch 4 of automation
-#   E (emergency on, battery <49V) are not gated by this cooldown and remain
-#   the safety net for genuinely urgent cases.
+#   E (emergency grid-charge, battery <49V) are not gated by this cooldown
+#   and remain the safety net for genuinely urgent cases.
 #
-#   Voltage check on turn-on only
-#     The >210 V voltage check (real grid present) is applied to the turn-on
-#     branch. No voltage check on turn-off — we always want to be able to
-#     turn the breaker off.
-#
-#   SOC validity on turn-off
-#     Prevents false turn-off caused by BMS flapping to unknown — when SOC
+#   SOC validity on stop_charge
+#     Prevents false mode-switch caused by BMS flapping to unknown — when SOC
 #     becomes unknown, energy_deficit sensor returns 0 (by design, as a safety
 #     default), which would trigger stop_charge. The validity check blocks this.
 #
 # Entity ID mapping (replace with your own):
 #   sensor.energy_deficit           → energy deficit template sensor (kWh)
-#   switch.grid_switch              → your smart breaker switch entity
-#   sensor.breaker_voltage          → voltage sensor on the smart breaker (V)
-#   sensor.battery_soc_effective    → BMS SOC sensor
-#   input_number.locked_target_soc  → helper written by automation A at 23:05
+#   select.inverter_output_priority → inverter's output-source-priority select
+#     (options: GRID_CHARGE / AUTONOMOUS — vendor-specific strings, see automation_a)
+#   select.inverter_charge_priority → inverter's charge-source-priority select
+#     (options: SOLAR_AND_GRID / SOLAR_ONLY — vendor-specific strings, see automation_a)
+#   sensor.battery_soc_effective    → BMS/inverter SOC sensor
 #   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
 
 alias: "EMS: Emergency night correction (C)"
 description: >
-  v2.7 — symmetric debounce: for:2min added to stop_charge trigger (was
-  on need_charge only). Native for:30min state condition on the breaker
-  replaces the old template last_changed check, applied to BOTH the
-  turn-on and turn-off branches (was turn-off only). Fixes a real
-  multi-cycle flapping incident — see docs/anti-flapping-case-study.md.
+  v3.0 — same symmetric-debounce / symmetric-minimum-runtime-guard logic as
+  v2.7, retargeted from a physical breaker to the inverter's own
+  output/charge priority selects (select.select_option instead of
+  switch.turn_on/off). See docs/anti-flapping-case-study.md for the incident
+  that produced v2.7, and docs/model.md#inverter-mode-switching for why the
+  actuator changed in v3.0.
 
 triggers:
   - trigger: numeric_state
@@ -98,66 +96,82 @@ conditions:
     after: "23:06:00"
     before: "06:57:00"
   - alias: "SOC reading is valid"
-    condition: template
-    value_template: >
-      {{ states('sensor.battery_soc_effective') not in
-         ['unavailable', 'unknown', 'none', 'None', ''] }}
+    condition: not
+    conditions:
+      - condition: state
+        entity_id: sensor.battery_soc_effective
+        state:
+          - "unavailable"
+          - "unknown"
 
 actions:
   - choose:
-      - alias: "Deficit too high — turn breaker on"
+      - alias: "Deficit too high — switch inverter to grid-charge mode"
         conditions:
           - condition: trigger
             id: need_charge
-          - alias: "Breaker has been off for at least 30 minutes"
+          - alias: "Inverter has been in autonomous mode for at least 30 minutes"
             condition: state
-            entity_id: switch.grid_switch
-            state: "off"
+            entity_id: select.inverter_output_priority
+            state: AUTONOMOUS
             for:
               minutes: 30
-          - condition: numeric_state
-            entity_id: sensor.breaker_voltage
-            above: 210
-            alias: "Real grid present (>210 V, not phantom voltage)"
         sequence:
-          - action: switch.turn_on
+          - action: select.select_option
             target:
-              entity_id: switch.grid_switch
+              entity_id: select.inverter_output_priority
+            data:
+              option: GRID_CHARGE
+          - action: select.select_option
+            target:
+              entity_id: select.inverter_charge_priority
+            data:
+              option: SOLAR_AND_GRID
           - action: notify.send_message
             target:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
               message: >
-                ⚡ *EMS: Emergency charge — night (C)*
+                ⚡ *EMS: Emergency grid-charge — night (C)*
                 Need: {{ states('sensor.energy_deficit') }} kWh
                 | SOC: {{ states('sensor.battery_soc_effective') }}%
                 | Target: {{ states('input_number.locked_target_soc') | int }}%
 
-      - alias: "Deficit cleared — turn breaker off"
+      - alias: "Deficit cleared — switch inverter to autonomous mode"
         conditions:
           - condition: trigger
             id: stop_charge
-          - alias: "Breaker has been on for at least 30 minutes"
+          - alias: "Inverter has been in grid-charge mode for at least 30 minutes"
             condition: state
-            entity_id: switch.grid_switch
-            state: "on"
+            entity_id: select.inverter_output_priority
+            state: GRID_CHARGE
             for:
               minutes: 30
-          - alias: "SOC valid before turning off"
-            condition: template
-            value_template: >
-              {{ states('sensor.battery_soc_effective') not in
-                 ['unavailable', 'unknown', 'none', 'None', ''] }}
+          - alias: "SOC valid before switching"
+            condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.battery_soc_effective
+                state:
+                  - "unavailable"
+                  - "unknown"
         sequence:
-          - action: switch.turn_off
+          - action: select.select_option
             target:
-              entity_id: switch.grid_switch
+              entity_id: select.inverter_output_priority
+            data:
+              option: AUTONOMOUS
+          - action: select.select_option
+            target:
+              entity_id: select.inverter_charge_priority
+            data:
+              option: SOLAR_ONLY
           - action: notify.send_message
             target:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
               message: >
-                ✅ *EMS: Deficit cleared — breaker off (C)*
+                ✅ *EMS: Deficit cleared — autonomous mode (C)*
                 Remaining: {{ states('sensor.energy_deficit') }} kWh
                 | SOC: {{ states('sensor.battery_soc_effective') }}%
 

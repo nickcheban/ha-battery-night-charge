@@ -105,6 +105,52 @@ If you only have one array, this collapses back to the original single-source
 form — see the comments in `helpers/sensor_energy_deficit.yaml` for the exact
 lines to remove.
 
+## Inverter mode switching
+
+**v1.x–v2.7** of this package decided "charge from grid tonight, yes/no" by
+turning a physical Zigbee/Tuya grid-input breaker on and off. That breaker
+was a mechanical relay being cycled on a decision that can legitimately
+change several times a night (forecast correction, BMS noise, grid blips)
+— see [`docs/anti-flapping-case-study.md`](anti-flapping-case-study.md) for
+a real incident where an asymmetric debounce let that relay flap 5 times in
+one night, including a 3-second on→off flip. v2.7 fixed the *symptom*
+(symmetric debounce + minimum-runtime guard, the standard HA community
+fix for short-cycling).
+
+**v3.0** removes the underlying exposure instead of just guarding around it.
+After a hardware upgrade, the new inverter exposes its own
+output-source-priority and charge-source-priority selects (e.g.
+`PV-Battery-Utility` / `PV-Utility-Battery` and `PV Priority` / `PV and
+Utility` — exact option strings are vendor/model-specific). The breaker is
+now left permanently energised, and every automation that used to call
+`switch.turn_on` / `switch.turn_off` now calls `select.select_option`
+against those two selects instead:
+
+| Old actuator | New actuator |
+|---|---|
+| `switch.turn_on` (breaker) | `select.select_option` → `GRID_CHARGE` on output priority + `SOLAR_AND_GRID` on charge priority |
+| `switch.turn_off` (breaker) | `select.select_option` → `AUTONOMOUS` on output priority + `SOLAR_ONLY` on charge priority |
+
+The breaker's voltage sensor is **still read** (automation E still triggers
+off it) — it remains the most reliable "is the grid actually present" signal,
+since the breaker's radio chip is powered from the same upstream line the
+grid protection relay switches, independent of whether Home Assistant ever
+commands the relay itself. What changed is that the breaker is no longer an
+*actuator* in this package, only a *sensor*.
+
+**Why this is a better fix, not just a different one:**
+- A relay has a finite mechanical cycle life; an inverter-firmware mode
+  select does not wear out the same way.
+- The v2.7 debounce/guard logic didn't disappear — it was ported as-is onto
+  the new actuator (same `for:` windows, same 30-minute minimum-runtime
+  guard, same hysteresis band). Removing the breaker from the loop doesn't
+  remove the need for debouncing a noisy deficit sensor; it just removes the
+  mechanical-wear consequence of getting it wrong.
+- If your inverter has no equivalent mode select and a breaker is genuinely
+  your only actuator, the pre-v3.0 logic (available in the git history / the
+  original `switch.turn_on`/`switch.turn_off` shape shown in the diffs above)
+  is still valid — this repo just no longer documents it as the primary path.
+
 ## Parameters
 
 | Parameter | Value | Notes |

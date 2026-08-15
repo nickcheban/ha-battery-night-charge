@@ -1,10 +1,17 @@
-# Automation B: Turn off breaker when target SOC is reached
-# ==========================================================
+# Automation B: Switch inverter back to autonomous mode when target SOC is reached
+# ===================================================================================
 # Watches sensor.battery_soc_effective throughout the night.
-# Turns the breaker off as soon as SOC has held at or above
-# min(locked_target + 2%, 95%) for 30 seconds.
+# Switches the inverter back to autonomous (solar-only) mode as soon as SOC
+# has held at or above min(locked_target + 2%, 95%) for 30 seconds.
 #
-# Design decisions:
+# v3.0 — see automation_a for the architecture change: this no longer turns a
+# physical breaker off, it switches select.inverter_output_priority /
+# select.inverter_charge_priority back to AUTONOMOUS / SOLAR_ONLY. The guard
+# condition changed accordingly — from "breaker is on" to "inverter is
+# currently in grid-charge mode" (no point re-asserting autonomous mode if
+# it's already there).
+#
+# Design decisions (unchanged from v2.5):
 #
 #   for: 30 seconds (not 2 minutes)
 #     BMS units commonly report SOC as `unknown` for ~35 seconds during active
@@ -14,26 +21,31 @@
 #     target crossing.
 #
 #   min(target + 2%, 95%) threshold
-#     The +2% buffer prevents the breaker from turning off right at the target
-#     and then immediately triggering automation C (emergency correction) which
-#     would turn it back on. The 95% cap ensures this automation doesn't stall
-#     if locked_target_soc is set to 95% or above.
+#     The +2% buffer prevents the inverter from switching mode right at the
+#     target and then immediately triggering automation C (emergency
+#     correction) which would switch it back. The 95% cap ensures this
+#     automation doesn't stall if locked_target_soc is set to 95% or above.
 #
 #   SOC validity check
 #     Explicit check that SOC is not unavailable/unknown before acting.
-#     Prevents false turn-off when BMS flaps to unknown mid-charge.
+#     Prevents false mode-switch when BMS flaps to unknown mid-charge.
 #
 # Entity ID mapping (replace with your own):
-#   sensor.battery_soc_effective    → BMS SOC sensor
-#   switch.grid_switch              → your smart breaker switch entity
+#   sensor.battery_soc_effective    → BMS/inverter SOC sensor
+#   select.inverter_output_priority → inverter's output-source-priority select
+#     (options: GRID_CHARGE / AUTONOMOUS — vendor-specific strings, see automation_a)
+#   select.inverter_charge_priority → inverter's charge-source-priority select
+#     (options: SOLAR_AND_GRID / SOLAR_ONLY — vendor-specific strings, see automation_a)
 #   input_number.locked_target_soc  → helper written by automation A at 23:05
 #   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
 
-alias: "EMS: Breaker off — target SOC reached (B)"
+alias: "EMS: Autonomous mode — target SOC reached (B)"
 description: >
-  v2.5 — turns breaker off when SOC ≥ min(target+2%, 95%) stable for 30 s.
-  30 s debounce chosen because BMS units flap to unknown ~35 s during charging,
-  making longer windows unreliable. SOC validity check prevents false off on flap.
+  v3.0 — switches inverter back to autonomous (solar-only) mode when SOC ≥
+  min(target+2%, 95%) stable for 30 s. 30 s debounce chosen because BMS units
+  flap to unknown ~35 s during charging, making longer windows unreliable.
+  SOC validity check prevents false switch on flap. No longer targets a
+  physical breaker.
 
 triggers:
   - trigger: state
@@ -43,8 +55,8 @@ triggers:
 
 conditions:
   - condition: state
-    entity_id: switch.grid_switch
-    state: "on"
+    entity_id: select.inverter_output_priority
+    state: GRID_CHARGE
   - condition: time
     after: "23:05:00"
     before: "06:57:00"
@@ -56,21 +68,31 @@ conditions:
       {% set threshold = [target + 2, 95] | min %}
       {{ current >= 0 and current >= threshold }}
   - alias: "SOC reading is valid"
-    condition: template
-    value_template: >
-      {{ states('sensor.battery_soc_effective') not in
-         ['unavailable', 'unknown', 'none', 'None', ''] }}
+    condition: not
+    conditions:
+      - condition: state
+        entity_id: sensor.battery_soc_effective
+        state:
+          - "unavailable"
+          - "unknown"
 
 actions:
-  - action: switch.turn_off
+  - action: select.select_option
     target:
-      entity_id: switch.grid_switch
+      entity_id: select.inverter_output_priority
+    data:
+      option: AUTONOMOUS
+  - action: select.select_option
+    target:
+      entity_id: select.inverter_charge_priority
+    data:
+      option: SOLAR_ONLY
   - action: notify.send_message
     target:
       entity_id: notify.YOUR_TELEGRAM_BOT
     data:
       message: >
-        🔋 *EMS: Target reached — breaker OFF (B)*
+        🔋 *EMS: Target reached — autonomous mode (B)*
         SOC: {{ states('sensor.battery_soc_effective') }}% reached target
         {{ states('input_number.locked_target_soc') | int }}% + 2% buffer
 

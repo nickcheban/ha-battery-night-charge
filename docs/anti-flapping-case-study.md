@@ -106,6 +106,20 @@ is the more declarative way to get symmetric hysteresis without hand-rolling
 two triggers with separate on/off values — worth considering if you're
 building this from scratch rather than patching an existing automation.
 
+## Postscript (v3.0): the actuator changed, not just the debounce
+
+This case study describes the breaker-toggling architecture (v1.x–v2.7).
+Since then, the package moved to switching the inverter's own
+output/charge-priority mode instead of a physical breaker — see
+[`docs/model.md#inverter-mode-switching`](model.md#inverter-mode-switching).
+The v2.7 debounce and minimum-runtime-guard logic described above is still
+exactly what protects the (now different) actuator from short-cycling; only
+the target of `select.select_option` vs. `switch.turn_on/off` changed. This
+case study is kept as-is because the diagnosis method and the general
+short-cycling lesson are unchanged and still the most useful part of this
+document — the specific mechanical-relay-wear risk it originally motivated
+is what the v3.0 architecture change addresses at the root.
+
 ## Sources
 
 - [Home Assistant Community: Bouncing switch](https://community.home-assistant.io/t/bouncing-switch/77119)
