@@ -1,0 +1,49 @@
+# Template sensor: sensor.grid_charge_current_target
+# ===================================================
+# The grid-charge current (A, battery side) at which household load + battery
+# charging stay within the grid-import budget AS SEEN BY THE UTILITY METER.
+# Read by automation G, which writes it to the inverter.
+#
+#   budget_inverter = budget / meter_correction
+#   amps = (budget_inverter − household load) / (V_battery / 0.9)
+#   rounded DOWN to a multiple of 5 A, clamped to 0…max
+#
+# Why "/ (V_battery / 0.9)": one amp into the battery costs about V_battery /
+# 0.9 watts from the grid (charger losses). Measured here: ~59 W per amp at
+# 53 V — grid import was ~1.78 kW above household load while charging at 30 A.
+#
+# Why the meter correction: the inverter's grid-power reading is ~12–14 %
+# lower than the utility's own meter (see docs/grid-import-limiter.md). The
+# meter is what trips, so the budget is expressed in meter watts.
+#
+# Examples at 53 V, budget 4500 W, correction 1.14, max 60 A:
+#   load 0.5 kW → 55 A (~4.3 kW on the meter)
+#   load 1.0 kW → 50 A (~4.5 kW)
+#   load 2.3 kW → 25 A (~4.3 kW)   e.g. a kettle on top of background load
+#   load 3.5 kW →  5 A → automation G moves the house to battery instead
+#
+# How to install:
+#   Settings → Devices & Services → Helpers → Create Helper → Template → Sensor
+#   State: the `state:` block. Unit: A.
+#   Advanced → Availability: the `availability:` block.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.inverter_load_power                → household load (inverter output), W
+#   sensor.battery_voltage                    → battery voltage, V
+#   input_number.grid_import_budget           → W on the utility meter (e.g. 4500)
+#   input_number.utility_meter_correction     → meter ÷ inverter (e.g. 1.14)
+#   input_number.grid_charge_current_max      → upper limit, A (e.g. 60)
+
+state: >
+  {% set load = states('sensor.inverter_load_power') | float(0) %}
+  {% set vb = states('sensor.battery_voltage') | float(52) %}
+  {% set k = states('input_number.utility_meter_correction') | float(1.14) %}
+  {% set budget = (states('input_number.grid_import_budget') | float(4500)) / k %}
+  {% set imax = states('input_number.grid_charge_current_max') | float(60) %}
+  {% set a = [(budget - load) / (vb / 0.9), imax] | min %}
+  {{ ([((a / 5) | round(0, 'floor')) * 5, 0] | max) | int }}
+
+availability: >
+  {{ has_value('sensor.inverter_load_power') }}
+
+unit_of_measurement: A

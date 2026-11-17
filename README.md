@@ -5,6 +5,19 @@ a home battery from the grid — and automatically manages the inverter's own
 charge-mode selects throughout the night based on an hourly solar generation
 forecast.
 
+> **v4.0 — winter mode.** The target is now "enough to reach the next 23:00"
+> (the start of the next cheap night window) instead of "enough to reach the
+> first two hours of stable generation". In summer the two give the same
+> answer; from October to March the old rule left the battery flat every
+> cloudy evening. v4.0 also adds a grid-import limiter (automation G) for a
+> 5 kW utility connection, fixes a time-zone bug that silently removed one of
+> the two forecast sources after the switch to winter time, and adds a
+> forecast derating factor. Tuned for the current ~13.3 kWh battery; a
+> 2 × 16 kWh bank is next (see [Hardware context](#hardware-context)).
+> Details: [`docs/model.md#v40-winter-horizon`](docs/model.md#v40-winter-horizon),
+> [`docs/backtest-horizon.md`](docs/backtest-horizon.md),
+> [`docs/grid-import-limiter.md`](docs/grid-import-limiter.md).
+
 > **v3.0 architecture note:** earlier versions of this package (documented in
 > [`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md))
 > made this decision by toggling a physical grid-input breaker on and off.
@@ -24,14 +37,17 @@ forecast.
 > running system and are removed. See [Known issues](#known-issues) for what
 > the running system still gets wrong.
 
-> **AI-assisted project.** The logic, backtest methodology and bug fixes in this
-> repository were developed iteratively in partnership with
-> [Claude](https://claude.ai) (Anthropic). The AI helped analyse real historical
-> sensor data from InfluxDB, identify edge cases, write and validate Jinja2
-> templates, run backtests against ~110 days of recorded data before any
-> automation went live, and later diagnose a real production flapping
-> incident from history and trace data (see
-> [`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md)).
+> **Who did what.** The project — the system and its hardware, the goals,
+> every design decision, and running it in production — is led by the author.
+> Analysis and calculations were done with [Claude](https://claude.ai)
+> (Anthropic): querying and analysing historical sensor data in InfluxDB,
+> backtests (including the 249-night horizon comparison for v4.0), drafting
+> Jinja2 templates and automations and checking them against the live Home
+> Assistant, and diagnosing the flapping incident from history and traces
+> (see [`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md)).
+> Claude's proposals went into production only after the author reviewed them;
+> some were rejected or changed — for example, locking the target at 23:05 and
+> a "house on grid after charging" hold mode.
 
 ---
 
@@ -43,9 +59,11 @@ up from the cheap night tariff?"*
 
 A fixed threshold ("charge if SOC < X%") wastes money on grid electricity that
 solar would have covered for free a few hours later. This package instead asks:
-**starting from right now, how much energy is actually needed to make it to
-the first two consecutive hours where generation covers load?** — and
-recalculates that answer dynamically throughout the night.
+**starting from right now, how much energy does the battery need to hold to
+reach the next 23:00 — the start of the next cheap night window — given the
+hourly forecast?** — and recalculates that answer throughout the night. (Up to
+v3.1 the question stopped at "the first two hours where generation covers
+load"; that is the same answer in summer and the wrong one in winter.)
 
 ---
 
@@ -56,7 +74,16 @@ recalculates that answer dynamically throughout the night.
   each catches a different part of the day instead of one compromise-angle
   array — roughly 180° apart (e.g. one biased toward morning sun, one toward
   afternoon sun), same tilt
-- LiFePO4 battery pack with a BMS exposing SOC
+- LiFePO4 battery with a BMS exposing SOC. **Currently ~13.3 kWh (full
+  capacity as reported by the BMS) — all parameters in this release are tuned
+  for it.** Two new packs are already on
+  hand: 2 × 16 kWh (each 16S, 314 Ah LiFePO4 cells, ANENJI ANJ-314AH-S),
+  ~32 kWh in total. The package will be re-tuned for that bank (capacity,
+  reserve, charge currents); with ~13.3 kWh, 27 of 249 backtest nights needed
+  more than fits under the 95 % cap
+- A 5 kW grid connection limit enforced by the utility's smart meter
+  (exceeding it disconnects the house for ~10 minutes) — handled by
+  automation G
 - An over/under-voltage protection relay on the grid input (opens above
   255 V) — the street supply often sits right at that limit at night, so the
   grid "disappears" and "comes back" many times a night
@@ -77,19 +104,22 @@ single-source form.
 
 ## How the decision is made
 
-At 23:05, a template sensor walks hour-by-hour from the current hour through
-the overnight window (23:00–11:00 the next morning), comparing a conservative
-solar forecast against a seasonal hourly load profile. It stops accumulating
-deficit as soon as generation covers load for two consecutive hours. The result
-is a kWh deficit figure — if it exceeds 0.5 kWh, the SOC reading is valid and
+A template sensor walks hour by hour from now to the next 23:00, keeping a
+running balance of seasonal hourly load minus the conservative solar
+forecast × a derating factor (0.8). The **peak** of that running balance is
+what the battery must hold on top of the safety floor and a 1.5 kWh reserve
+(capped at 95 %). On a sunny day the peak is in the morning — the same answer
+as the old "until stable generation" rule; on a cloudy day it is in the
+evening — enough for the whole day. At 23:05 the resulting kWh deficit — if it exceeds 0.5 kWh, the SOC reading is valid and
 the grid is present, the inverter is switched into grid-charge mode. The same
 sensors keep recalculating all night; B stops charging when SOC reaches the
 *current* target, C reacts if the forecast changes, E reacts to the grid
 coming and going.
 
-**Forecast source:** `min(Solcast hourly, Open-Meteo hourly)` per hour — the
-more conservative of two independent sources, chosen to reduce the chance of a
-single bad forecast leaving the battery flat. On the Open-Meteo side, if you
+**Forecast source:** `min(Solcast hourly, Open-Meteo hourly)` per hour × 0.8 —
+the more conservative of two independent sources, then derated (over
+late October – mid November the actual/forecast ratio of that `min()` was
+0.81). On the Open-Meteo side, if you
 have two PV arrays on separate azimuths, their forecasts are summed before
 this comparison (see Hardware context above).
 
@@ -120,6 +150,7 @@ tag if it still fails. Grid presence everywhere means
 | **D** | Morning safety reset | Time 06:58 | Unconditional autonomous mode via the retry script — the layer that must work even if everything else is broken. |
 | **E** | Grid loss / recovery | Grid voltage < 50 V (30 s), > 200 V (2 min), every 15 min | Grid lost while grid-charging → autonomous (keeps HA in sync with the hardware). Grid back at night with deficit > 0.5 → grid-charge (the 15-min tick is the safety net for a missed edge). Target already met → autonomous. Daytime → autonomous. Battery < 49 V → grid-charge. |
 | **F** | Recovery after HA restart | HA `start` + 120 s | Night, deficit > 0.5 kWh, inverter autonomous, grid present → grid-charge. Local notification only. |
+| **G** | Grid import limiter (v4.0) | Target charge current changes / mode changes / metered import > 4.8 kW for 20 s | While grid-charging: sets the inverter's grid-charge current to what fits under the import budget (down at once, up after 2 min stable). Less than 10 A fits or import too high → house on battery, resumes when load drops. See [`docs/grid-import-limiter.md`](docs/grid-import-limiter.md). |
 
 ---
 
@@ -158,6 +189,14 @@ from 23:00 regardless of the current hour (causing identical readings at 01:30
 and 05:00).
 
 Full methodology and results: [`docs/backtest.md`](docs/backtest.md).
+
+**Pass 4 — horizon change (v4.0, 249 nights, March–November):** old "until
+stable generation" rule vs new "peak balance until next 23:00", on actual
+data. Identical on 144 of 150 nights May–September; the new rule never asks
+for less, and adds where the evening isn't covered — 12 of 30 nights in
+October, 9 of 14 in early November. Over 22 November days the old rule saw
+1.45 kWh of need on average where 4.8 kWh were needed. Details:
+[`docs/backtest-horizon.md`](docs/backtest-horizon.md).
 
 ---
 
@@ -216,6 +255,22 @@ value oscillates around a hysteresis band (not just a single threshold),
 debounce *both* sides of the band the same way — an asymmetric debounce is
 exactly what caused the incident above.
 
+**Look at the peak of the balance, not at a calendar.** "Until stable
+generation" and "until tonight" are the same question on a sunny day and very
+different ones on a cloudy day. Taking the peak of the running
+load-minus-generation balance up to the next cheap window answers both without
+a summer/winter switch — and a calendar switch would have been wrong anyway
+(winter-like days happen in June, summer-like days in November).
+
+**Express a limit in the units of whoever enforces it.** The 5 kW limit is
+enforced by the utility's meter, which reads ~13 % higher than the inverter.
+The budget is set in meter watts and converted, so "4500" means 4500 on the
+meter, not 5100.
+
+**Never build a timestamp by hand.** A literal `+03:00` in a lookup key worked
+all summer and then silently removed half of the forecast the night the
+clocks changed. Build the key from an actual datetime.
+
 **Two independent forecast sources, combined pessimistically.** Relying on one
 weather API is a single point of failure for the most important input. Taking
 `min()` of two sources per hour costs almost nothing and removes an entire
@@ -253,9 +308,6 @@ Documented here because the repo mirrors what actually runs:
   cut-over (52 V) acts first in practice.
 - **B has a dead trigger** (`deficit_below_0_5`) with no matching branch.
 - **A's grid check at 23:05 is an instantaneous reading**, no debounce.
-- **The Open-Meteo hour key uses a hard-coded `+03:00` offset**, so after the
-  switch to winter time Open-Meteo silently drops out of the forecast `min()`.
-  Fixed in v4.0.
 
 ---
 
@@ -283,6 +335,15 @@ Before importing automations, create these in
 | `input_number.battery_capacity_kwh` | Number | Usable battery capacity in kWh |
 | `input_number.minimum_soc_floor` | Number | Minimum SOC % you want at dawn |
 | `input_number.locked_target_soc` | Number | Written by automation A at 23:05 for the notification text only |
+| `input_number.forecast_derate` | Number (0.5–1.0, step 0.05) | Multiplier on the forecast — default 0.8 |
+| `input_number.grid_import_budget` | Number (W) | Import budget in **utility-meter** watts — default 4500 for a 5 kW limit |
+| `input_number.utility_meter_correction` | Number (1.00–1.30) | Utility meter ÷ inverter grid power — default 1.14; calibrate your own (see `docs/grid-import-limiter.md`) |
+| `input_number.grid_charge_current_max` | Number (A) | Upper limit for the grid-charge current — default 60 |
+| `input_boolean.grid_import_overload` | Toggle | Set by automation G while the house is held on battery |
+
+Template sensors (each file in `helpers/` says how to create it):
+`sensor.target_soc_tonight`, `sensor.energy_deficit`,
+`sensor.grid_charge_current_target`, `sensor.grid_import_metered`.
 
 Also create the script from [`scripts/set_mode_with_retry.yaml`](scripts/set_mode_with_retry.yaml)
 with the id `inverter_set_mode_with_retry`.
@@ -296,7 +357,10 @@ All entity IDs in this repo use generic names. Map them to your actual entities:
 | `select.inverter_output_priority` | Your inverter's output-source-priority select. Options used in this repo: `AUTONOMOUS` (your inverter's "prioritize battery/solar over grid" mode, e.g. "PV-Battery-Utility"/"SBU") and `GRID_CHARGE` (your inverter's "prioritize grid for charging" mode, e.g. "PV-Utility-Battery"/"SUB") — substitute your integration's actual option strings |
 | `select.inverter_charge_priority` | Your inverter's charge-source-priority select. Options used in this repo: `SOLAR_ONLY` (e.g. "PV Priority") and `SOLAR_AND_GRID` (e.g. "PV and Utility") — substitute your integration's actual option strings |
 | `sensor.inverter_grid_voltage` | Grid voltage as seen by the inverter's input (after any protection relay) — the grid-presence signal |
-| `sensor.battery_voltage` | Battery voltage (automation E's emergency branch) |
+| `sensor.battery_voltage` | Battery voltage (automation E's emergency branch, automation G's W-per-amp) |
+| `sensor.inverter_grid_power` | Inverter's grid input power, W (automation G) |
+| `sensor.inverter_load_power` | Inverter's output (household load) power, W (automation G) |
+| `number.inverter_max_grid_charge_current` | Inverter's max AC/grid charge current setting, A (written by automation G) |
 | `sensor.battery_soc_effective` | Your SOC sensor (must go `unavailable`, not stale) |
 | `sensor.pv_forecast_today/tomorrow` | Solcast entities |
 | `sensor.energy_production_today/tomorrow` | Open-Meteo Solar Forecast entities — PV array 1 |
@@ -310,6 +374,27 @@ The `load_profile_by_season` dict in the sensor templates is built from one
 specific household's data. **It will not match your house.** Export your own
 hourly consumption averages from your energy monitoring tool and replace the
 values before deploying, in both sensor templates.
+
+---
+
+## Changelog
+
+- **v4.0 (2026-11)** — winter mode. Target horizon "until next 23:00" (peak of
+  running balance) replaces "until two covered hours / 11:00"; forecast
+  derate 0.8; Open-Meteo hour key built from a real datetime (fixes the
+  `+03:00` bug that dropped Open-Meteo after the DST change);
+  `energy_deficit` derived from `target_soc_tonight`; new automation G (grid
+  import limiter, meter-calibrated budget, grid-charge current up to 60 A).
+  Tuned for ~13.3 kWh; 2 × 16 kWh re-tune pending.
+- **v3.1 (2026-11)** — repo synced with the running system: retry script,
+  grid presence from inverter input voltage, E handles grid loss + 15-min
+  tick, live target, P10 blend and load correction removed, known issues
+  listed.
+- **v3.0 (2026-08)** — inverter mode switching replaces breaker toggling.
+- **v2.7 (2026-08)** — symmetric debounce fix after a relay-flapping incident;
+  dual-array PV support.
+- **v2.x (2026-07)** — hourly deficit model, dynamic recalculation, restart
+  recovery.
 
 ---
 

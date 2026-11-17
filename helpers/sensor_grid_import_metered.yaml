@@ -1,0 +1,33 @@
+# Template sensor: sensor.grid_import_metered
+# ============================================
+# Grid import as the UTILITY METER sees it: the inverter's grid-power reading
+# multiplied by a correction factor.
+#
+# The correction factor comes from months of comparing a household energy
+# meter against the utility meter's own readings: the household clamp meter
+# reads 1.155× low against the utility meter, a smart breaker's energy counter
+# reads ~2 % above the clamp meter, and the inverter's instantaneous grid
+# power matches the breaker within ~1 %. So utility meter ≈ inverter × 1.12–1.14.
+# Use your own numbers — see docs/grid-import-limiter.md.
+#
+# Used by automation G's hard safety trigger (> 4800 W for 20 s).
+#
+# How to install:
+#   Settings → Devices & Services → Helpers → Create Helper → Template → Sensor
+#   State: the `state:` block. Unit: W, device class: power,
+#   state class: measurement. Advanced → Availability: the `availability:` block.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.inverter_grid_power             → inverter's grid input power, W
+#   input_number.utility_meter_correction  → meter ÷ inverter (e.g. 1.14)
+
+state: >
+  {{ ((states('sensor.inverter_grid_power') | float(0))
+      * (states('input_number.utility_meter_correction') | float(1.14))) | round(0) }}
+
+availability: >
+  {{ has_value('sensor.inverter_grid_power') }}
+
+unit_of_measurement: W
+device_class: power
+state_class: measurement

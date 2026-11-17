@@ -1,0 +1,240 @@
+# Automation G: Grid import limiter (charge-current regulator)
+# =============================================================
+# New in v4.0.
+#
+# The problem: the grid connection has a 5 kW limit enforced by the utility's
+# smart meter — exceed it for a minute or so and the meter disconnects the
+# house for ~10 minutes. With grid-charging at a fixed current, a kettle or a
+# dishwasher heating cycle at night is enough to cross it. Raising the charge
+# current (to fit more energy into short grid windows — see README) makes
+# that worse.
+#
+# What G does while the inverter is grid-charging
+# (output GRID_CHARGE + charge SOLAR_AND_GRID):
+#   - keeps number.inverter_max_grid_charge_current equal to
+#     sensor.grid_charge_current_target (budget − household load, in amps):
+#     DOWN immediately on every change, UP only after the target has been
+#     stable for 2 minutes, set straight away when charging starts;
+#   - if less than 10 A would fit, or the meter-corrected grid import stays
+#     above 4800 W for 20 s, moves the house to battery
+#     (output AUTONOMOUS, charge priority left at SOLAR_AND_GRID) and raises
+#     input_boolean.grid_import_overload; Telegram only for the hard 4800 W case;
+#   - when load allows ≥ 15 A for 2 minutes again, sets the current and
+#     resumes grid-charging — at night only if the battery still needs it
+#     (deficit > 0.3 kWh); if the target was reached meanwhile, finishes
+#     charging instead;
+#   - clears the overload flag whenever some other automation switches grid
+#     charging off (A/B/C/D/E all set charge priority SOLAR_ONLY).
+#
+# The inverter-side hold (AUTONOMOUS + SOLAR_AND_GRID) is used only by G and
+# only while the flag is on. Other automations treat it as "not grid-charging".
+#
+# Two template conditions remain on purpose: the trigger.from_state guard
+# (a numeric_state trigger re-arms after `unavailable`) and the current
+# comparison between two entities.
+#
+# Entity ID mapping (replace with your own):
+#   sensor.grid_charge_current_target     → helpers/sensor_grid_charge_current_target.yaml
+#   sensor.grid_import_metered            → helpers/sensor_grid_import_metered.yaml
+#   sensor.inverter_grid_power, sensor.inverter_load_power
+#   number.inverter_max_grid_charge_current → inverter's max AC (grid) charge current
+#   input_boolean.grid_import_overload    → flag helper
+#   sensor.energy_deficit, select.inverter_output_priority,
+#   select.inverter_charge_priority, script.inverter_set_mode_with_retry,
+#   notify.YOUR_TELEGRAM_BOT
+
+alias: "EMS: Grid import limiter (G)"
+description: >
+  v4.0 — keeps grid import within input_number.grid_import_budget (utility
+  meter watts) while grid-charging: adjusts the inverter's grid charge current,
+  moves the house to battery when < 10 A would fit or metered import > 4.8 kW
+  for 20 s, resumes when load drops.
+mode: queued
+max: 3
+max_exceeded: silent
+
+triggers:
+  - trigger: state
+    entity_id: sensor.grid_charge_current_target
+    not_to: ["unavailable", "unknown"]
+    id: down
+  - trigger: state
+    entity_id: sensor.grid_charge_current_target
+    not_to: ["unavailable", "unknown"]
+    for:
+      minutes: 2
+    id: up
+  - trigger: state
+    entity_id:
+      - select.inverter_output_priority
+      - select.inverter_charge_priority
+    not_to: ["unavailable", "unknown"]
+    id: mode
+  - trigger: numeric_state
+    entity_id: sensor.grid_import_metered
+    above: 4800
+    for:
+      seconds: 20
+    id: grid_over
+
+conditions: []
+
+variables:
+  cur: "{{ states('number.inverter_max_grid_charge_current') | float(0) }}"
+  want: "{{ states('sensor.grid_charge_current_target') | float(-1) }}"
+
+actions:
+  - choose:
+      - alias: "Grid charging switched off by others → clear overload flag"
+        conditions:
+          - condition: state
+            entity_id: input_boolean.grid_import_overload
+            state: "on"
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.inverter_charge_priority
+                state: SOLAR_AND_GRID
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.grid_import_overload
+
+      - alias: "Import over budget → house on battery"
+        conditions:
+          - condition: state
+            entity_id: select.inverter_output_priority
+            state: GRID_CHARGE
+          - condition: state
+            entity_id: select.inverter_charge_priority
+            state: SOLAR_AND_GRID
+          - condition: or
+            conditions:
+              - condition: numeric_state
+                entity_id: sensor.grid_charge_current_target
+                below: 10
+              - condition: and
+                conditions:
+                  - condition: trigger
+                    id: grid_over
+                  - condition: template
+                    value_template: >
+                      {{ trigger.platform == 'numeric_state' and trigger.from_state is not none
+                         and is_number(trigger.from_state.state) }}
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.grid_import_overload
+          - alias: "House on battery (grid charging stays allowed)"
+            action: select.select_option
+            continue_on_error: true
+            target:
+              entity_id: select.inverter_output_priority
+            data:
+              option: AUTONOMOUS
+          - if:
+              - condition: trigger
+                id: grid_over
+            then:
+              - action: notify.send_message
+                target:
+                  entity_id: notify.YOUR_TELEGRAM_BOT
+                data:
+                  message: >
+                    ⚠️ EMS: metered grid import {{ states('sensor.grid_import_metered') }} W > 4.8 kW (G)
+                    Inverter reading: {{ states('sensor.inverter_grid_power') }} W, house load: {{ states('sensor.inverter_load_power') }} W
+                    House moved to battery; charging resumes when the load drops.
+
+      - alias: "Load dropped, charge still needed → resume grid charging"
+        conditions:
+          - condition: trigger
+            id: [up, mode]
+          - condition: state
+            entity_id: input_boolean.grid_import_overload
+            state: "on"
+          - condition: state
+            entity_id: select.inverter_output_priority
+            state: AUTONOMOUS
+          - condition: state
+            entity_id: select.inverter_charge_priority
+            state: SOLAR_AND_GRID
+          - condition: numeric_state
+            entity_id: sensor.grid_charge_current_target
+            above: 14
+          - condition: or
+            conditions:
+              - condition: time
+                after: "06:58:00"
+                before: "23:00:00"
+              - condition: numeric_state
+                entity_id: sensor.energy_deficit
+                above: 0.3
+        sequence:
+          - action: number.set_value
+            continue_on_error: true
+            target:
+              entity_id: number.inverter_max_grid_charge_current
+            data:
+              value: "{{ want }}"
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.grid_import_overload
+          - action: script.inverter_set_mode_with_retry
+            data:
+              output_priority: GRID_CHARGE
+              charge_priority: SOLAR_AND_GRID
+              caller_tag: G
+              fail_context: "Charging did not resume after an overload."
+
+      - alias: "Target reached at night during an overload → finish charging"
+        conditions:
+          - condition: state
+            entity_id: input_boolean.grid_import_overload
+            state: "on"
+          - condition: state
+            entity_id: select.inverter_output_priority
+            state: AUTONOMOUS
+          - condition: state
+            entity_id: select.inverter_charge_priority
+            state: SOLAR_AND_GRID
+          - condition: time
+            after: "23:00:00"
+            before: "06:58:00"
+          - condition: numeric_state
+            entity_id: sensor.energy_deficit
+            below: 0.3
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.grid_import_overload
+          - action: script.inverter_set_mode_with_retry
+            data:
+              output_priority: AUTONOMOUS
+              charge_priority: SOLAR_ONLY
+              caller_tag: G
+
+      - alias: "Grid charging → adjust current"
+        conditions:
+          - condition: state
+            entity_id: select.inverter_output_priority
+            state: GRID_CHARGE
+          - condition: state
+            entity_id: select.inverter_charge_priority
+            state: SOLAR_AND_GRID
+          - condition: numeric_state
+            entity_id: sensor.grid_charge_current_target
+            above: 9
+          - condition: template
+            value_template: >
+              {{ (trigger.id == 'down' and want < cur)
+                 or (trigger.id in ['up', 'mode'] and want != cur) }}
+        sequence:
+          - action: number.set_value
+            continue_on_error: true
+            target:
+              entity_id: number.inverter_max_grid_charge_current
+            data:
+              value: "{{ want }}"
+
+trace:
+  stored_traces: 50

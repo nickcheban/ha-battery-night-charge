@@ -42,6 +42,54 @@ target_soc    = target_energy / battery_capacity_kwh
 The **two-consecutive-hours** rule avoids stopping early on a single lucky
 hour immediately followed by clouds.
 
+## v4.0 winter horizon
+
+The rule above answers "how much do I need until generation covers load for
+two hours in a row?". From spring to autumn that is the right question. In
+November it isn't: on a cloudy day generation covers load for a few midday
+hours, the rule stops counting there, and the battery runs flat in the
+evening — then the daytime tariff pays for what the night tariff should have.
+Measured over 22 November days the old rule saw on average 1.45 kWh of need
+where 4.8 kWh were actually needed ([`backtest-horizon.md`](backtest-horizon.md)).
+
+v4.0 replaces the stop rule with a horizon to the **next 23:00** — the start of
+the next cheap window:
+
+```
+balance = 0, peak = 0
+for each hour h from now until the next 23:00:
+    balance += load_profile[h] − forecast[h] × derate
+    peak = max(peak, balance)
+
+target_energy = floor + peak / round_trip_efficiency + reserve_kwh
+target_soc    = min(target_energy / capacity, 95 %)
+```
+
+The **peak** of the running balance, not its end value and not the sum of
+positive hours:
+
+- **Sunny day:** the balance peaks in the morning before PV takes over; the
+  evening never climbs back above that peak. Result = the old answer.
+- **Cloudy day:** the balance keeps rising until 23:00. Result = enough for the
+  whole day (up to the 95 % cap).
+- **In between:** the peak is whichever is higher — the morning or the evening.
+
+No season switch is needed; a sunny November day behaves like summer and a
+cloudy June day like winter. On 249 nights (March–November) the two rules
+agree on 144 of 150 nights May–September and diverge mostly in October and
+November.
+
+`forecast[h] = min(Open-Meteo array 1 + array 2, Solcast P50)`, a source
+counting when it has a data point for that hour, times
+`input_number.forecast_derate` (default 0.8, from actual ÷ forecast = 0.81 over
+26.10–16.11).
+
+The first hour counts only its remaining minutes, so the target falls
+smoothly through the night as consumption passes.
+
+`sensor.energy_deficit` is now simply `max(target − SOC, 0) × capacity` — the
+calculation lives in one template instead of two hand-synchronised copies.
+
 ## Why it recalculates dynamically, not just once at 23:05
 
 An earlier version of the sensor always started its loop from 23:00, even when
@@ -76,11 +124,12 @@ and `minute < 5`), the model treats this the same as hour 23 and uses
 don't always update exactly at 00:00:00, and reading a freshly-rotated entity
 in that window can return stale data.
 
-**Known accepted risk:** this mitigation is a simple time-based heuristic, not
-a robust fix. A complete solution would look up the correct hour by its actual
-ISO timestamp key in *both* entities, rather than picking one by name. This is
-deferred — the edge case window is narrow (~5 minutes) and the consequences
-are bounded (one re-evaluation might use slightly stale data).
+**Replaced in v4.0.** Each hour is now an actual timestamp (`now()` rounded to
+the hour + *i* hours); its date picks the `_today` or `_tomorrow` entity, and
+`t.isoformat()` is the Open-Meteo key. This also fixes a worse bug: up to v3.1
+the key was built as `date + 'T' + hour + ':00:00+03:00'`. After the switch to
+winter time (UTC+2) no key matched, and Open-Meteo silently dropped out of the
+`min()` — the model ran on Solcast alone from late October.
 
 ## Two PV arrays on independent MPPT inputs
 
@@ -160,8 +209,9 @@ valid through an outage, unlike the breaker's radio chip (see
 | Reserve | 1.5 kWh | Fixed buffer on top of calculated deficit |
 | Battery capacity | `input_number.battery_capacity_kwh` | Set to your usable kWh |
 | Charge threshold | 0.5 kWh | `energy_deficit > 0.5` triggers automation A |
-| Night window | 23:00–11:00 | Wide enough for slow winter sunrise |
-| Forecast source filter | > 10 Wh | A source counts for an hour only if it forecasts more than 10 Wh |
+| Horizon | now → next 23:00 | v4.0; was 23:00–11:00 with a "two covered hours" stop rule |
+| Forecast derate | `input_number.forecast_derate`, default 0.8 | v4.0; multiplier on the per-hour `min()` forecast |
+| Forecast source filter | data point present | v4.0; v3.1 required > 10 Wh |
 
 ## Load profile
 
@@ -203,9 +253,12 @@ deploying. These numbers are specific to one home and will not transfer.
 
 ## Open questions / deliberately deferred
 
-- **Forecast error buffer.** The model takes the forecast at face value
-  (pessimistic `min()` of two sources plus a fixed 1.5 kWh reserve). A
-  derating factor is added in v4.0.
+- **Forecast error buffer.** Addressed in v4.0 by a single derating factor on
+  the combined forecast; a per-source or per-weather-type error model is not
+  done.
+- **Capacity.** With ~13.3 kWh, 27 of 249 nights need more than fits
+  under the 95 % cap. Parameters will be re-tuned for the 2 × 16 kWh bank
+  (see README → Hardware context).
 - **Full kWh-based comparison throughout.** Internal calculations are energy-
   based (kWh), but the threshold comparisons in automations B and E still
   compare SOC percentages.
