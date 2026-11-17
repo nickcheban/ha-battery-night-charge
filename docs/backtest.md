@@ -8,9 +8,9 @@ from InfluxDB before the model replaced the previous fixed-threshold version.
 All data pulled from InfluxDB (`ha_data` bucket) covering approximately 110
 days (late February – mid July 2026):
 
-- **PV generation:** `powmr_6_2kw_pv_input_power` (W, hourly mean)
-- **Battery SOC:** `f1_battery` (%, hourly mean from BMS)
-- **Household load:** `2w_pwm_power_b` (W, hourly mean — inverter output to loads)
+- **PV generation:** the inverter's PV input power sensor (W, hourly mean)
+- **Battery SOC:** the BMS SOC sensor (%, hourly mean)
+- **Household load:** a clamp-meter channel on the inverter output (W, hourly mean)
 
 UTC → local time conversion was applied in Python (+3h offset), not in Flux
 queries — the `location:` parameter in `aggregateWindow()` was found to produce
@@ -113,7 +113,7 @@ was validated by simulation on real InfluxDB data.
 ### Data
 
 **July 2026:** 859 data points at 10-minute resolution from InfluxDB
-(`sensor.energii_ne_hvataet`). Switch history from HA recorder (168 state
+(`sensor.energy_deficit`). Switch history from HA recorder (168 state
 changes, 11 nights with active charging).
 
 **August 1→2, 2026:** 61 data points at 1-minute resolution (full resolution

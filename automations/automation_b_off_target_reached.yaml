@@ -1,57 +1,51 @@
-# Automation B: Switch inverter back to autonomous mode when target SOC is reached
-# ===================================================================================
-# Watches sensor.battery_soc_effective throughout the night.
-# Switches the inverter back to autonomous (solar-only) mode as soon as SOC
-# has held at or above min(locked_target + 2%, 95%) for 30 seconds.
+# Automation B: Stop grid charging when the target SOC is reached
+# =================================================================
+# Watches SOC through the night. As soon as SOC has held at or above
+# min(target + 2 %, 95 %) for 30 seconds while the inverter is in grid-charge
+# mode, switches back to autonomous mode.
 #
-# v3.0 — see automation_a for the architecture change: this no longer turns a
-# physical breaker off, it switches select.inverter_output_priority /
-# select.inverter_charge_priority back to AUTONOMOUS / SOLAR_ONLY. The guard
-# condition changed accordingly — from "breaker is on" to "inverter is
-# currently in grid-charge mode" (no point re-asserting autonomous mode if
-# it's already there).
+# ── v3.1 — synced with production ──────────────────────────────────────────
+#   - Reads the LIVE target (sensor.target_soc_tonight), not a value locked at
+#     23:05. The target falls through the night as the remaining night's
+#     consumption shrinks, so B stops charging as soon as the battery holds
+#     enough for what is left — and it also knows the real target on nights
+#     when charging was started by C or E instead of A.
+#   - Mode change goes through script.inverter_set_mode_with_retry.
 #
-# Design decisions (unchanged from v2.5):
+# Design decisions (unchanged):
+#   for: 30 seconds — BMS units commonly report SOC as `unknown` for ~35 s
+#   during charging; a 2-minute window almost never completes.
+#   +2 % buffer — so B doesn't stop right at the target and immediately hand
+#   over to C, which would start again. 95 % cap so B can't stall.
 #
-#   for: 30 seconds (not 2 minutes)
-#     BMS units commonly report SOC as `unknown` for ~35 seconds during active
-#     charging (cell balancing, BMS internal polling cycles). A 2-minute window
-#     almost never fires because `unknown` breaks the state continuity. 30 s
-#     is long enough to ignore transient flaps, short enough to catch the real
-#     target crossing.
-#
-#   min(target + 2%, 95%) threshold
-#     The +2% buffer prevents the inverter from switching mode right at the
-#     target and then immediately triggering automation C (emergency
-#     correction) which would switch it back. The 95% cap ensures this
-#     automation doesn't stall if locked_target_soc is set to 95% or above.
-#
-#   SOC validity check
-#     Explicit check that SOC is not unavailable/unknown before acting.
-#     Prevents false mode-switch when BMS flaps to unknown mid-charge.
+# Known issue: the trigger `deficit_below_0_5` (id below) has no matching
+# branch in `choose` — it is a leftover from an earlier design and does
+# nothing. Kept so the file matches the running automation.
 #
 # Entity ID mapping (replace with your own):
-#   sensor.battery_soc_effective    → BMS/inverter SOC sensor
-#   select.inverter_output_priority → inverter's output-source-priority select
-#     (options: GRID_CHARGE / AUTONOMOUS — vendor-specific strings, see automation_a)
-#   select.inverter_charge_priority → inverter's charge-source-priority select
-#     (options: SOLAR_AND_GRID / SOLAR_ONLY — vendor-specific strings, see automation_a)
-#   input_number.locked_target_soc  → helper written by automation A at 23:05
-#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+#   sensor.battery_soc_effective    → SOC sensor
+#   sensor.target_soc_tonight       → target SOC template sensor (%)
+#   sensor.energy_deficit           → energy deficit template sensor (kWh)
+#   select.inverter_output_priority → output-source-priority select
+#   script.inverter_set_mode_with_retry, notify.YOUR_TELEGRAM_BOT
 
-alias: "EMS: Autonomous mode — target SOC reached (B)"
+alias: "EMS: Stop charging at target (B)"
 description: >
-  v3.0 — switches inverter back to autonomous (solar-only) mode when SOC ≥
-  min(target+2%, 95%) stable for 30 s. 30 s debounce chosen because BMS units
-  flap to unknown ~35 s during charging, making longer windows unreliable.
-  SOC validity check prevents false switch on flap. No longer targets a
-  physical breaker.
+  v3.1 — switches the inverter back to autonomous mode when SOC ≥
+  min(live target + 2 %, 95 %) stable for 30 s, while grid-charging at night.
 
 triggers:
   - trigger: state
     entity_id: sensor.battery_soc_effective
     for:
       seconds: 30
+    id: soc_reached
+  - trigger: numeric_state
+    entity_id: sensor.energy_deficit
+    below: 0.5
+    for:
+      minutes: 10
+    id: deficit_below_0_5
 
 conditions:
   - condition: state
@@ -60,41 +54,39 @@ conditions:
   - condition: time
     after: "23:05:00"
     before: "06:57:00"
-  - alias: "SOC reached min(target+2, 95)"
-    condition: template
-    value_template: >
-      {% set current = states('sensor.battery_soc_effective') | float(-1) %}
-      {% set target = states('input_number.locked_target_soc') | int(20) %}
-      {% set threshold = [target + 2, 95] | min %}
-      {{ current >= 0 and current >= threshold }}
   - alias: "SOC reading is valid"
     condition: not
     conditions:
       - condition: state
         entity_id: sensor.battery_soc_effective
-        state:
-          - "unavailable"
-          - "unknown"
+        state: ["unavailable", "unknown", "none", "None", ""]
 
 actions:
-  - action: select.select_option
-    target:
-      entity_id: select.inverter_output_priority
-    data:
-      option: AUTONOMOUS
-  - action: select.select_option
-    target:
-      entity_id: select.inverter_charge_priority
-    data:
-      option: SOLAR_ONLY
-  - action: notify.send_message
-    target:
-      entity_id: notify.YOUR_TELEGRAM_BOT
-    data:
-      message: >
-        🔋 *EMS: Target reached — autonomous mode (B)*
-        SOC: {{ states('sensor.battery_soc_effective') }}% reached target
-        {{ states('input_number.locked_target_soc') | int }}% + 2% buffer
+  - choose:
+      - alias: "SOC ≥ live target + 2 %"
+        conditions:
+          - condition: trigger
+            id: soc_reached
+          - condition: template
+            value_template: >
+              {% set current = states('sensor.battery_soc_effective') | float(-1) %}
+              {% set target = states('sensor.target_soc_tonight') | int(20) %}
+              {% set threshold = [target + 2, 95] | min %}
+              {{ current >= 0 and current >= threshold }}
+        sequence:
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                EMS: target reached, charging stopped (B)
+                SOC: {{ states('sensor.battery_soc_effective') }}% ≥ target {{ states('sensor.target_soc_tonight') | int }}% + 2%
+          - action: script.inverter_set_mode_with_retry
+            data:
+              output_priority: AUTONOMOUS
+              charge_priority: SOLAR_ONLY
+              caller_tag: B
+              fail_context: "Still charging!"
 
 mode: single
 trace:

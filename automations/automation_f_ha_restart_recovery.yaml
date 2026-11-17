@@ -1,56 +1,28 @@
 # Automation F: Recovery after Home Assistant restart
 # =====================================================
-# Fires on Home Assistant startup. Waits 2 minutes for the BMS and the
-# 7-day load Statistics helper to report valid readings, then checks
-# whether the inverter should be in grid-charge mode but isn't — e.g. HA
-# restarted mid-night (update, crash, add-on restart) and missed the window
-# during which automation A, C, or E would otherwise have set it.
+# Fires on Home Assistant start. Waits 2 minutes for the inverter integration
+# and the 7-day load statistics helper to report real values, then checks
+# whether the inverter should be grid-charging but isn't — e.g. HA restarted
+# mid-night and missed the window in which A, C or E would have acted.
 #
-# ── v3.0 — architecture change: inverter mode switching, not breaker toggling ──
-# Retargeted from switch.turn_on (physical breaker) to select.select_option
-# (inverter mode) — mirrors the same change applied to A/B/C/D/E. See
-# docs/model.md#inverter-mode-switching.
-#
-# Why this is necessary:
-#   Automations A, C and E only run on discrete triggers (a specific time,
-#   a sensor crossing a threshold, a voltage recovery). None of those
-#   triggers fire retroactively after HA restarts. Without this automation,
-#   the inverter would silently stay in autonomous mode for the rest of the
-#   night even though energy_deficit correctly reports a need to charge.
-#
-# Design decisions:
-#
-#   120 second delay
-#     On HA startup, the BMS integration and the 7-day load Statistics
-#     helper both take time to produce their first valid reading. Acting
-#     before they're ready risks reading stale or default values.
-#
-#   sensor.avg_load_7d > 5 sanity check
-#     Guards against acting when the Statistics helper hasn't accumulated
-#     real history yet (e.g. right after first install, or after the
-#     helper was recreated) — its default/empty state should not be read
-#     as "zero load".
-#
-#   persistent_notification, not Telegram
-#     This fires rarely, right after a restart, when Telegram delivery
-#     could plausibly not have caught up yet. Local visibility is enough.
+# ── v3.1 — synced with production ──────────────────────────────────────────
+#   - Requires the grid to be present (inverter input > 200 V), so a restart
+#     during an outage doesn't "start" charging; E picks it up when the grid
+#     returns.
+#   - Still writes the selects directly and notifies locally
+#     (persistent_notification), not via Telegram.
+#   - The SOC check only rejects `unavailable` (not `unknown`).
 #
 # Entity ID mapping (replace with your own):
-#   sensor.battery_soc_effective    → BMS/inverter SOC sensor
-#   sensor.avg_load_7d              → 7-day average daily load sensor
-#   sensor.energy_deficit           → energy deficit template sensor (kWh)
-#   select.inverter_output_priority → inverter's output-source-priority select
-#     (options: AUTONOMOUS / GRID_CHARGE — vendor-specific strings, see automation_a)
-#   select.inverter_charge_priority → inverter's charge-source-priority select
-#     (options: SOLAR_ONLY / SOLAR_AND_GRID — vendor-specific strings, see automation_a)
+#   sensor.battery_soc_effective, sensor.avg_load_7d (sanity check that the
+#   statistics helper has data), sensor.energy_deficit,
+#   sensor.inverter_grid_voltage, select.inverter_output_priority,
+#   select.inverter_charge_priority
 
 alias: "EMS: Recovery after HA restart (F)"
 description: >
-  v3.0 — if HA restarts mid-night and the inverter is in autonomous mode
-  despite energy_deficit > 0.5 kWh, switches it to grid-charge mode. 120 s
-  delay lets the BMS and the 7-day load Statistics helper come up before
-  acting. Retargeted from a physical breaker (v2.3) to the inverter's own
-  mode selects.
+  v3.1 — after HA start + 120 s: night, SOC valid, load history valid,
+  deficit > 0.5 kWh, inverter autonomous, grid present → grid-charge.
 
 triggers:
   - trigger: homeassistant
@@ -61,21 +33,18 @@ conditions: []
 actions:
   - delay:
       seconds: 120
-
   - choose:
-      - alias: "Night, SOC valid, load history valid, charge needed"
+      - alias: "Night, SOC valid, load history valid, charge needed, grid present"
         conditions:
           - condition: time
             after: "23:05:00"
             before: "06:57:00"
-          - alias: "SOC valid"
-            condition: not
+          - condition: not
             conditions:
               - condition: state
                 entity_id: sensor.battery_soc_effective
                 state: "unavailable"
-          - alias: "Load-history helper has real data"
-            condition: numeric_state
+          - condition: numeric_state
             entity_id: sensor.avg_load_7d
             above: 5
           - condition: numeric_state
@@ -84,6 +53,10 @@ actions:
           - condition: state
             entity_id: select.inverter_output_priority
             state: AUTONOMOUS
+          - alias: "Grid present"
+            condition: numeric_state
+            entity_id: sensor.inverter_grid_voltage
+            above: 200
         sequence:
           - action: select.select_option
             target:
@@ -97,10 +70,9 @@ actions:
               option: SOLAR_AND_GRID
           - action: notify.persistent_notification
             data:
-              title: "EMS: Recovery after HA restart"
+              title: "EMS: recovery after HA restart"
               message: >
-                HA restarted. Inverter switched to grid-charge mode.
-                SOC: {{ states('sensor.battery_soc_effective') }}%
-                | Need: {{ states('sensor.energy_deficit') }} kWh
+                HA restarted at night. Inverter switched to grid-charge (F).
+                SOC: {{ states('sensor.battery_soc_effective') }}% | Need: {{ states('sensor.energy_deficit') }} kWh
 
 mode: single

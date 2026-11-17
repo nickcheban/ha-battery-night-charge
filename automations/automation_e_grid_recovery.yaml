@@ -1,89 +1,95 @@
-# Automation E: Grid recovery after voltage relay trip
-# =====================================================
-# Fires when breaker voltage rises above 210 V and holds for 2 minutes.
-# This is the reliable signal that the grid has actually returned — phantom
-# voltage readings (10–175 V from a de-energised chip) cannot sustain 210 V+
-# for 2 minutes. See docs/phantom_voltage.md for full analysis.
+# Automation E: Grid loss and grid recovery
+# ==========================================
+# The grid here is cut regularly — by scheduled outages and, much more often,
+# by the household's own over/under-voltage protection relay (it opens above
+# 255 V, and the street supply sits at 250–260 V at night). E keeps the
+# inverter mode consistent with reality across those cuts.
 #
-# ── v3.0 — architecture change: inverter mode switching, not breaker toggling ──
-# The breaker itself is no longer switched on/off by this package (it's left
-# permanently energised — see docs/model.md#inverter-mode-switching). This
-# automation still exists and still triggers off the breaker's voltage
-# sensor, because that sensor remains the most reliable "is the grid
-# actually present" signal available: the breaker's radio chip is powered
-# from the same upstream line the grid protection relay switches, so its
-# voltage reading still drops into phantom range during a real outage even
-# though Home Assistant never commands the relay itself anymore. What
-# changed is what the automation *does* about it — instead of turning the
-# breaker back on/off, it re-evaluates and sets the correct inverter mode,
-# because an inverter mode selection made by automation A/C during an outage
-# may be stale by the time the grid comes back (e.g. A decided "grid-charge"
-# at 23:05, grid dropped at 23:10 before the inverter could act on it, grid
-# returns at 01:00 — the inverter needs to be told the current decision, not
-# assume it already applied the earlier one).
+# ── v3.1 — synced with production ──────────────────────────────────────────
+# Grid presence is read from the inverter's own grid-input voltage (after the
+# protection relay), not from the smart breaker's voltage sensor. The inverter
+# is battery-powered, so its reading doesn't suffer from the breaker's
+# "phantom voltage" (docs/phantom_voltage.md); the 2-minute hold on the
+# recovery trigger is kept anyway.
 #
-# Four branches (evaluated in order, first match wins):
+# Three triggers:
+#   (no id)   grid voltage > 200 V for 2 min — the grid came back
+#   cron15    every 15 minutes — safety net in case the recovery edge was
+#             missed (HA restart, integration reconnect)
+#   grid_lost grid voltage < 50 V for 30 s — the grid went away
 #
-#   Branch 1 — Night + charge needed → grid-charge mode
-#     Time: 23:01–06:58, energy_deficit > 0.5 kWh, SOC valid, inverter
-#     currently in autonomous mode → switch to grid-charge
+# Branches (first match wins):
+#   1. grid_lost while grid-charging → autonomous mode, silently. Keeps HA's
+#      idea of the mode in sync with what the inverter is physically doing.
+#   2. Night + deficit > 0.5 + not grid-charging + grid present → grid-charge.
+#   3. Same as 2, for the cron15 trigger (explicit trigger condition).
+#   4. Night + SOC ≥ live target + 2 % while grid-charging → autonomous.
+#   5. Daytime (06:58–23:01) while grid-charging → autonomous.
+#   6. Battery < 49 V at any time → grid-charge (protect the battery).
 #
-#   Branch 2 — Night + target already reached → autonomous mode
-#     Time: 23:01–06:58, SOC ≥ min(target+2%, 95%), inverter currently in
-#     grid-charge mode → target is met, switch to autonomous to stop
-#     over-charging
+# Known issue (branch 5 vs 6): in daytime with the battery below 49 V, cron15
+# alternates between branch 6 (grid-charge) and branch 5 (back to autonomous)
+# every 15 minutes, because 5 is checked first. In practice the inverter's own
+# low-battery cut-over (52 V here) acts long before 49 V, so it hasn't fired.
 #
-#   Branch 3 — Daytime (06:58–23:04) → force autonomous mode
-#     Inverter in grid-charge mode during peak tariff hours → force
-#     autonomous unconditionally. Handles the scenario where a decision from
-#     the previous night was never corrected by automation D for some reason.
-#
-#   Branch 4 — Battery critically low → grid-charge mode any time
-#     Battery voltage < 49 V regardless of time or tariff
-#     Emergency: keep the house from losing power entirely
-#     Note: 49 V as a threshold for LiFePO4 is based on inverter voltage
-#     measurement, validated against BMS data (mean deviation < 0.15 V
-#     across 86 paired hourly readings).
-#
-# Time boundary: branches 1 and 2 use after: 23:01 (not 23:00) to allow
-# one minute for forecast integrations to complete their midnight entity
-# rotation (today ↔ tomorrow). Acting in the first seconds of midnight on
-# stale "tomorrow" data is the known risk mitigated here.
+# Branches 1, 4, 5 and 6 still write the selects directly instead of using the
+# retry script.
 #
 # Entity ID mapping (replace with your own):
-#   sensor.breaker_voltage          → voltage sensor on the (always-on) breaker
-#   sensor.energy_deficit           → energy deficit template sensor (kWh)
-#   sensor.battery_soc_effective    → BMS/inverter SOC sensor
-#   input_number.locked_target_soc  → helper written by automation A at 23:05
-#   sensor.battery_voltage          → inverter battery voltage sensor (V)
-#   select.inverter_output_priority → inverter's output-source-priority select
-#     (options: GRID_CHARGE / AUTONOMOUS — vendor-specific strings, see automation_a)
-#   select.inverter_charge_priority → inverter's charge-source-priority select
-#     (options: SOLAR_AND_GRID / SOLAR_ONLY — vendor-specific strings, see automation_a)
-#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+#   sensor.inverter_grid_voltage, sensor.energy_deficit,
+#   sensor.battery_soc_effective, sensor.target_soc_tonight,
+#   sensor.battery_voltage, select.inverter_output_priority,
+#   select.inverter_charge_priority, script.inverter_set_mode_with_retry,
+#   notify.YOUR_TELEGRAM_BOT
 
-alias: "EMS: Grid recovery (E)"
+alias: "EMS: Grid loss / recovery (E)"
 description: >
-  v3.0 — fires when breaker voltage > 210 V for 2 minutes (real grid
-  returned; breaker itself is always-on, this reads its voltage sensor
-  only). Four branches: grid-charge if needed / confirm target reached /
-  force autonomous daytime / emergency grid-charge if battery critically
-  low. Retargeted from switch.turn_on/off to select.select_option — see
-  docs/model.md#inverter-mode-switching.
+  v3.1 — grid lost → autonomous; grid back (2 min) or every 15 min → resume
+  grid-charging if still needed at night; target already met → autonomous;
+  daytime → autonomous; battery < 49 V → grid-charge.
 
 triggers:
   - trigger: numeric_state
-    entity_id: sensor.breaker_voltage
-    above: 210
+    entity_id: sensor.inverter_grid_voltage
+    above: 200
     for:
       minutes: 2
+  - trigger: time_pattern
+    minutes: "/15"
+    id: cron15
+  - trigger: numeric_state
+    entity_id: sensor.inverter_grid_voltage
+    below: 50
+    for:
+      seconds: 30
+    id: grid_lost
 
 conditions: []
 
 actions:
   - choose:
-      # Branch 1: Night window + charge still needed → grid-charge mode
-      - alias: "Night + charge needed → grid-charge mode"
+      - alias: "Grid lost → autonomous (no notification)"
+        conditions:
+          - condition: trigger
+            id: grid_lost
+          - condition: state
+            entity_id: select.inverter_output_priority
+            state: GRID_CHARGE
+        sequence:
+          - action: select.select_option
+            continue_on_error: true
+            target:
+              entity_id: select.inverter_output_priority
+            data:
+              option: AUTONOMOUS
+          - action: select.select_option
+            continue_on_error: true
+            target:
+              entity_id: select.inverter_charge_priority
+            data:
+              option: SOLAR_ONLY
+
+      - alias: "Night + charge needed → grid-charge"
         conditions:
           - condition: time
             after: "23:01:00"
@@ -91,40 +97,74 @@ actions:
           - condition: numeric_state
             entity_id: sensor.energy_deficit
             above: 0.5
-          - alias: "SOC reading is valid"
-            condition: not
+          - condition: not
             conditions:
               - condition: state
                 entity_id: sensor.battery_soc_effective
-                state:
-                  - "unavailable"
-                  - "unknown"
-          - condition: state
-            entity_id: select.inverter_output_priority
-            state: AUTONOMOUS
+                state: ["unavailable", "unknown", "none", "None", ""]
+          - alias: "Not grid-charging"
+            condition: not
+            conditions:
+              - condition: state
+                entity_id: select.inverter_charge_priority
+                state: SOLAR_AND_GRID
+          - alias: "Grid present"
+            condition: numeric_state
+            entity_id: sensor.inverter_grid_voltage
+            above: 200
         sequence:
-          - action: select.select_option
-            target:
-              entity_id: select.inverter_output_priority
-            data:
-              option: GRID_CHARGE
-          - action: select.select_option
-            target:
-              entity_id: select.inverter_charge_priority
-            data:
-              option: SOLAR_AND_GRID
           - action: notify.send_message
             target:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
               message: >
-                🔌 *EMS: Grid returned — grid-charge mode ON (E)*
-                SOC: {{ states('sensor.battery_soc_effective') }}%
-                | Need: +{{ states('sensor.energy_deficit') }} kWh
-                | Target: {{ states('input_number.locked_target_soc') | int }}%
+                EMS: grid back, charging resumed (E)
+                SOC: {{ states('sensor.battery_soc_effective') }}% | Need: +{{ states('sensor.energy_deficit') }} kWh
+                Grid: {{ states('sensor.inverter_grid_voltage') }} V
+          - action: script.inverter_set_mode_with_retry
+            data:
+              output_priority: GRID_CHARGE
+              charge_priority: SOLAR_AND_GRID
+              caller_tag: E
 
-      # Branch 2: Night window + target already reached → autonomous mode
-      - alias: "Night + target reached → autonomous mode"
+      - alias: "cron15 safety net"
+        conditions:
+          - condition: trigger
+            id: cron15
+          - condition: time
+            after: "23:01:00"
+            before: "06:58:00"
+          - condition: numeric_state
+            entity_id: sensor.inverter_grid_voltage
+            above: 200
+          - condition: numeric_state
+            entity_id: sensor.energy_deficit
+            above: 0.5
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: select.inverter_charge_priority
+                state: SOLAR_AND_GRID
+          - condition: not
+            conditions:
+              - condition: state
+                entity_id: sensor.battery_soc_effective
+                state: ["unavailable", "unknown", "none", "None", ""]
+        sequence:
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                EMS: charging restored (E cron15)
+                SOC: {{ states('sensor.battery_soc_effective') }}% | Need: +{{ states('sensor.energy_deficit') }} kWh
+          - action: script.inverter_set_mode_with_retry
+            data:
+              output_priority: GRID_CHARGE
+              charge_priority: SOLAR_AND_GRID
+              caller_tag: E cron15
+
+      - alias: "Night + target already reached → autonomous"
         conditions:
           - condition: time
             after: "23:01:00"
@@ -132,7 +172,7 @@ actions:
           - condition: template
             value_template: >
               {% set current = states('sensor.battery_soc_effective') | float(-1) %}
-              {% set target = states('input_number.locked_target_soc') | int(20) %}
+              {% set target = states('sensor.target_soc_tonight') | int(20) %}
               {% set threshold = [target + 2, 95] | min %}
               {{ current >= 0 and current >= threshold }}
           - condition: state
@@ -154,16 +194,14 @@ actions:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
               message: >
-                ✅ *EMS: Grid returned — target already met, autonomous mode (E)*
-                SOC: {{ states('sensor.battery_soc_effective') }}%
-                ≥ target {{ states('input_number.locked_target_soc') | int }}% + 2%
+                EMS: grid back, target already met (E)
+                SOC: {{ states('sensor.battery_soc_effective') }}% ≥ target {{ states('sensor.target_soc_tonight') | int }}%
 
-      # Branch 3: Daytime (06:58–23:04) → force autonomous mode unconditionally
-      - alias: "Daytime → force autonomous mode"
+      - alias: "Daytime (06:58–23:01) → autonomous"
         conditions:
           - condition: time
             after: "06:58:00"
-            before: "23:04:00"
+            before: "23:01:00"
           - condition: state
             entity_id: select.inverter_output_priority
             state: GRID_CHARGE
@@ -182,13 +220,9 @@ actions:
             target:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
-              message: >
-                ☀️ *EMS: Grid returned daytime — forced autonomous mode (E)*
-                Peak tariff hours. SOC: {{ states('sensor.battery_soc_effective') }}%.
-                Inverter switched to autonomous mode to avoid peak tariff consumption.
+              message: "EMS: grid back in daytime (E) — inverter set to autonomous mode."
 
-      # Branch 4: Battery critically low → grid-charge mode regardless of time or tariff
-      - alias: "Emergency — battery critically low → grid-charge mode"
+      - alias: "Emergency: battery < 49 V → grid-charge"
         conditions:
           - condition: numeric_state
             entity_id: sensor.battery_voltage
@@ -209,10 +243,8 @@ actions:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
               message: >
-                ⚠️ *EMS: EMERGENCY — battery critically low, grid-charge mode ON (E)*
-                Grid returned. Battery voltage:
-                {{ states('sensor.battery_voltage') }} V (< 49 V threshold).
-                Inverter switched to grid-charge mode regardless of time or tariff.
+                ⚠️ EMS: EMERGENCY — battery < 49 V (E)
+                Battery: {{ states('sensor.battery_voltage') }} V. Inverter set to grid-charge.
 
 mode: single
 trace:

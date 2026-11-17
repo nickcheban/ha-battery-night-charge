@@ -1,65 +1,45 @@
-# Automation A: Lock target SOC and set inverter charge mode for the night
-# ===========================================================================
-# Fires once per night at 23:05 (local time).
+# Automation A: Night charge decision (23:05)
+# ============================================
+# Fires once per night at 23:05 (local time) and sets the inverter mode for
+# the start of the night. The rest of the night is handled by B (stop at
+# target), C (forecast changed), E (grid came back) and D (06:58 reset).
 #
-# ── v3.0 — architecture change: inverter mode switching, not breaker toggling ──
-# Earlier versions of this package (v1.x–v2.7) decided whether to charge by
-# turning a physical grid-input breaker on/off. After a hardware upgrade
-# (larger hybrid inverter with independent output-source-priority and
-# charge-source-priority selects), the breaker is now left permanently
-# energised, and "charge from grid tonight, yes/no" is decided by switching
-# the *inverter's own* mode instead. See docs/model.md#inverter-mode-switching
-# for the full rationale — in short: the breaker only ever needs to gate
-# whether the house is powered at all, not whether the battery charges from
-# grid, so removing it from the nightly decision loop eliminates an entire
-# class of relay-wear/flapping incidents (see
-# docs/anti-flapping-case-study.md) at the source, rather than just
-# debouncing around it.
+# ── v3.1 — synced with production ──────────────────────────────────────────
+#   - Mode changes go through script.inverter_set_mode_with_retry (verified
+#     write + one retry + alert) instead of two bare select calls.
+#   - Grid presence is checked on the inverter's own grid-input voltage
+#     (measured after the upstream voltage-protection relay), threshold 200 V.
+#     The smart-breaker voltage sensor used before v3.1 is no longer read.
+#   - New branch: charge is needed but there is no grid → only warn. The need
+#     is not lost: E starts charging as soon as the grid returns, C if the
+#     deficit keeps rising.
+#   - If the SOC sensor is momentarily invalid at 23:05 (reads < 1 %), wait up
+#     to 5 minutes for a real value before deciding.
+#   - The target is NOT locked any more. input_number.locked_target_soc is
+#     still written, but only for the notification text; B, C and E read the
+#     live target (see README → "Don't snapshot the target").
 #
-# Steps:
-#   1. Snapshots the current target SOC (from sensor.target_soc_tonight) into
-#      input_number.locked_target_soc — so the target doesn't drift overnight
-#      as the forecast updates.
-#   2. Waits 2 seconds for the helper write to propagate.
-#   3. If energy_deficit > 0.5 kWh AND SOC reading is valid:
-#        → switches the inverter into grid-charge mode, sends Telegram
-#          notification with details.
-#      Otherwise:
-#        → explicitly switches the inverter into autonomous (solar-only)
-#          mode and sends a "no charge needed" notification.
-#
-# Note on the "otherwise" branch: unlike the old breaker-based version (where
-# the breaker was normally already off, so the "no charge" path only had to
-# notify), this version explicitly re-asserts autonomous mode every night at
-# 23:05 regardless of what mode the inverter was left in during the day —
-# the inverter's mode is stateful hardware config, not a momentary action, so
-# the decision has to be asserted, not just implied by inaction.
+# Known limitation: the grid check at 23:05:00 is an instantaneous reading
+# with no debounce (a numeric_state condition cannot take `for:`). A template
+# binary sensor with delay_on would fix it; not done.
 #
 # Entity ID mapping (replace with your own):
-#   sensor.target_soc_tonight         → your target SOC template sensor (%)
-#   input_number.locked_target_soc    → helper number (written here, read by B, C, E)
-#   sensor.energy_deficit             → your energy deficit template sensor (kWh)
-#   sensor.battery_soc_effective      → BMS/inverter SOC sensor — must go unavailable, not stale
-#   input_number.battery_capacity_kwh → usable battery capacity in kWh
-#   select.inverter_output_priority   → inverter's output-source-priority select
-#     options used here: AUTONOMOUS (e.g. "PV-Battery-Utility" / "SBU") and
-#     GRID_CHARGE (e.g. "PV-Utility-Battery" / "SUB") — exact option strings
-#     are vendor/model-specific, check your inverter's integration
-#   select.inverter_charge_priority   → inverter's charge-source-priority select
-#     options used here: SOLAR_ONLY (e.g. "PV Priority") and
-#     SOLAR_AND_GRID (e.g. "PV and Utility") — same caveat as above
-#   sensor.grid_energy_deficit_info   → informational daily deficit sensor (optional)
-#   sensor.pv_forecast_tomorrow       → Solcast tomorrow entity
-#   sensor.energy_production_tomorrow → Open-Meteo Solar Forecast tomorrow entity
-#   sensor.avg_load_7d                → 7-day average daily load sensor (optional)
-#   notify.YOUR_TELEGRAM_BOT          → your Telegram notify entity
+#   sensor.target_soc_tonight        → target SOC template sensor (%)
+#   input_number.locked_target_soc   → helper, written here for display only
+#   sensor.energy_deficit            → energy deficit template sensor (kWh)
+#   sensor.battery_soc_effective     → SOC sensor
+#   sensor.inverter_grid_voltage     → inverter grid-input voltage (V)
+#   script.inverter_set_mode_with_retry → scripts/set_mode_with_retry.yaml
+#   notify.YOUR_TELEGRAM_BOT         → your Telegram notify entity
+#   Mode option strings (AUTONOMOUS, GRID_CHARGE, SOLAR_ONLY, SOLAR_AND_GRID)
+#   are placeholders — see README → Entity ID mapping.
 
-alias: "EMS: Lock target & set night charge mode (A)"
+alias: "EMS: Night charge decision 23:05 (A)"
 description: >
-  v3.0 — fires at 23:05. Locks target SOC into helper, switches the inverter
-  into grid-charge mode if energy_deficit > 0.5 kWh and SOC reading is valid,
-  otherwise explicitly switches it into autonomous (solar-only) mode. No
-  longer touches a physical grid breaker — see docs/model.md for why.
+  v3.1 — at 23:05 switches the inverter to grid-charge mode if
+  energy_deficit > 0.5 kWh, SOC is valid and the grid is present; warns if
+  charge is needed but the grid is absent; otherwise switches to autonomous
+  mode. All mode changes go through the retry script.
 
 triggers:
   - trigger: time
@@ -68,91 +48,91 @@ triggers:
 conditions: []
 
 actions:
-  # Step 1: snapshot target SOC so it doesn't drift overnight
-  - action: input_number.set_value
+  - alias: "Record tonight's starting target (display only)"
+    action: input_number.set_value
     target:
       entity_id: input_number.locked_target_soc
     data:
       value: "{{ states('sensor.target_soc_tonight') | int(20) }}"
-
-  # Step 2: wait for helper write to propagate
   - delay:
       seconds: 2
-
-  # Step 3: decide
+  - alias: "Wait for a valid SOC if the sensor is flapping (up to 5 min)"
+    if:
+      - condition: numeric_state
+        entity_id: sensor.battery_soc_effective
+        below: 1
+    then:
+      - wait_for_trigger:
+          - trigger: numeric_state
+            entity_id: sensor.battery_soc_effective
+            above: 0
+        timeout:
+          minutes: 5
+        continue_on_timeout: true
   - choose:
-      - alias: "Battery won't last — switch inverter to grid-charge mode"
+      - alias: "Charge needed, grid present → grid-charge mode"
         conditions:
           - condition: numeric_state
             entity_id: sensor.energy_deficit
             above: 0.5
-          - alias: "SOC reading is valid"
-            condition: not
-            conditions:
-              - condition: state
-                entity_id: sensor.battery_soc_effective
-                state:
-                  - "unavailable"
-                  - "unknown"
+          - condition: numeric_state
+            entity_id: sensor.battery_soc_effective
+            above: 0
+          - alias: "Grid present (inverter input voltage)"
+            condition: numeric_state
+            entity_id: sensor.inverter_grid_voltage
+            above: 200
         sequence:
-          - action: select.select_option
-            target:
-              entity_id: select.inverter_output_priority
-            data:
-              option: GRID_CHARGE
-          - action: select.select_option
-            target:
-              entity_id: select.inverter_charge_priority
-            data:
-              option: SOLAR_AND_GRID
           - action: notify.send_message
             target:
               entity_id: notify.YOUR_TELEGRAM_BOT
             data:
               message: >
-                🔌 *EMS: Grid-charge mode ON — 23:05*
-                SOC: {{ states('sensor.battery_soc_effective') }}%
-                ({{ (states('sensor.battery_soc_effective') | float(0) / 100
-                  * states('input_number.battery_capacity_kwh') | float(13.3))
-                  | round(1) }} kWh)
-                | Target: {{ states('input_number.locked_target_soc') | int }}%
-                | Need: +{{ states('sensor.energy_deficit') }} kWh
-                Forecast deficit: {{ states('sensor.grid_energy_deficit_info') }} kWh
-                | Open-Meteo: {{ states('sensor.energy_production_tomorrow') | float | round(1) }} kWh
-                | Solcast: {{ states('sensor.pv_forecast_tomorrow') | float | round(1) }} kWh
-                Avg load 7d: {{ states('sensor.avg_load_7d') }} kWh
-
+                EMS: night charge starting 23:05 (A)
+                SOC: {{ states('sensor.battery_soc_effective') }}% | Need: +{{ states('sensor.energy_deficit') }} kWh
+                Target: {{ states('input_number.locked_target_soc') | int }}%
+                Grid: {{ states('sensor.inverter_grid_voltage') }} V
+          - action: script.inverter_set_mode_with_retry
+            data:
+              output_priority: GRID_CHARGE
+              charge_priority: SOLAR_AND_GRID
+              caller_tag: A
+              fail_context: "Charging did NOT start!"
+      - alias: "Charge needed, but no grid → warn only"
+        conditions:
+          - condition: numeric_state
+            entity_id: sensor.energy_deficit
+            above: 0.5
+          - condition: numeric_state
+            entity_id: sensor.battery_soc_effective
+            above: 0
+          - alias: "Grid absent"
+            condition: numeric_state
+            entity_id: sensor.inverter_grid_voltage
+            below: 200
+        sequence:
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ⚠️ EMS: charge needed but NO GRID (A)
+                SOC: {{ states('sensor.battery_soc_effective') }}% | Deficit: {{ states('sensor.energy_deficit') }} kWh
+                Grid: {{ states('sensor.inverter_grid_voltage') }} V
+                E/C will start charging when the grid returns.
     default:
-      - action: select.select_option
-        target:
-          entity_id: select.inverter_output_priority
-        data:
-          option: AUTONOMOUS
-      - action: select.select_option
-        target:
-          entity_id: select.inverter_charge_priority
-        data:
-          option: SOLAR_ONLY
       - action: notify.send_message
         target:
           entity_id: notify.YOUR_TELEGRAM_BOT
         data:
           message: >
-            ✅ *EMS: No charge needed — 23:05*
-            SOC: {{ states('sensor.battery_soc_effective') }}%
-            ({{ (states('sensor.battery_soc_effective') | float(0) / 100
-              * states('input_number.battery_capacity_kwh') | float(13.3))
-              | round(1) }} kWh)
-            | Need: {{ states('sensor.energy_deficit') }} kWh
-            | Surplus: +{{ ((states('sensor.battery_soc_effective') | float(0) / 100
-              * states('input_number.battery_capacity_kwh') | float(13.3))
-              - (states('sensor.target_soc_tonight') | float(20) / 100
-              * states('input_number.battery_capacity_kwh') | float(13.3)))
-              | round(2) }} kWh
-            Forecast deficit: {{ states('sensor.grid_energy_deficit_info') }} kWh
-            | Open-Meteo: {{ states('sensor.energy_production_tomorrow') | float | round(1) }}
-            | Solcast: {{ states('sensor.pv_forecast_tomorrow') | float | round(1) }} kWh
-            Inverter set to autonomous (solar-only) mode.
+            EMS: no charge needed 23:05 (A)
+            SOC: {{ states('sensor.battery_soc_effective') }}% | Deficit: {{ states('sensor.energy_deficit') }} kWh
+      - action: script.inverter_set_mode_with_retry
+        data:
+          output_priority: AUTONOMOUS
+          charge_priority: SOLAR_ONLY
+          caller_tag: A
 
 mode: single
 trace:

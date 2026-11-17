@@ -15,6 +15,15 @@ forecast.
 > select, the breaker-toggling shape is still valid — see the pre-v3.0 diffs
 > referenced in the automation YAML comments.
 
+> **v3.1 sync note:** for a while the running system and this repo drifted
+> apart. v3.1 brings the repo back in line with what actually runs: all mode
+> changes go through one retry script, grid presence is read from the
+> inverter's own input voltage, automation E also handles grid *loss*, and the
+> target SOC is live rather than locked at 23:05. Two refinements documented
+> earlier (Solcast P10 blending, live load correction) are not part of the
+> running system and are removed. See [Known issues](#known-issues) for what
+> the running system still gets wrong.
+
 > **AI-assisted project.** The logic, backtest methodology and bug fixes in this
 > repository were developed iteratively in partnership with
 > [Claude](https://claude.ai) (Anthropic). The AI helped analyse real historical
@@ -48,11 +57,12 @@ recalculates that answer dynamically throughout the night.
   array — roughly 180° apart (e.g. one biased toward morning sun, one toward
   afternoon sun), same tilt
 - LiFePO4 battery pack with a BMS exposing SOC
-- A Zigbee/WiFi smart relay as the grid breaker — left permanently on as of
-  v3.0, its voltage sensor is still used as a grid-presence signal; see
-  [the phantom voltage problem](#the-phantom-voltage-problem) below for why
-  a cheap relay like this needs special handling even when only used as a
-  sensor
+- An over/under-voltage protection relay on the grid input (opens above
+  255 V) — the street supply often sits right at that limit at night, so the
+  grid "disappears" and "comes back" many times a night
+- A Zigbee/WiFi smart breaker on the grid input — left permanently on and, as
+  of v3.1, not read by this package at all (see
+  [the phantom voltage problem](#the-phantom-voltage-problem))
 - Inverter-side output-source-priority and charge-source-priority selects —
   the actual actuator this package drives as of v3.0 (see
   [`docs/model.md#inverter-mode-switching`](docs/model.md#inverter-mode-switching))
@@ -71,8 +81,11 @@ At 23:05, a template sensor walks hour-by-hour from the current hour through
 the overnight window (23:00–11:00 the next morning), comparing a conservative
 solar forecast against a seasonal hourly load profile. It stops accumulating
 deficit as soon as generation covers load for two consecutive hours. The result
-is a kWh deficit figure — if it exceeds 0.5 kWh and the SOC reading is valid,
-the inverter is switched into grid-charge mode.
+is a kWh deficit figure — if it exceeds 0.5 kWh, the SOC reading is valid and
+the grid is present, the inverter is switched into grid-charge mode. The same
+sensors keep recalculating all night; B stops charging when SOC reaches the
+*current* target, C reacts if the forecast changes, E reacts to the grid
+coming and going.
 
 **Forecast source:** `min(Solcast hourly, Open-Meteo hourly)` per hour — the
 more conservative of two independent sources, chosen to reduce the chance of a
@@ -81,9 +94,8 @@ have two PV arrays on separate azimuths, their forecasts are summed before
 this comparison (see Hardware context above).
 
 **Load profile:** a static hourly table built from ~110 days of real household
-consumption data, split into three seasons (winter/transition/summer), scaled
-by a live 7-day-average correction factor so it doesn't go stale. Replace the
-base table with your own data.
+consumption data, split into three seasons (winter/transition/summer). Replace
+it with your own data.
 
 Full design rationale, bugs found and fixed during development, and
 accepted known risks are documented in [`docs/model.md`](docs/model.md).
@@ -92,19 +104,22 @@ accepted known risks are documented in [`docs/model.md`](docs/model.md).
 
 ## Automations
 
-All six automations now act on `select.inverter_output_priority` /
-`select.inverter_charge_priority` (inverter mode) rather than a
-`switch.grid_switch` (breaker) — see
-[the v3.0 architecture note](#ha-battery-night-charge) above.
+All automations act on `select.inverter_output_priority` /
+`select.inverter_charge_priority` (inverter mode), and — except where noted —
+through one script, `script.inverter_set_mode_with_retry`
+([`scripts/set_mode_with_retry.yaml`](scripts/set_mode_with_retry.yaml)),
+which verifies the write, retries once after 30 s and alerts with the caller's
+tag if it still fails. Grid presence everywhere means
+`sensor.inverter_grid_voltage > 200 V`.
 
 | ID | Alias | Trigger | What it does |
 |----|-------|---------|--------------|
-| **A** | Lock target & set night charge mode | Time 23:05 | Snapshots the current target SOC into a helper (so it doesn't drift overnight), then switches the inverter into grid-charge mode if `energy_deficit > 0.5 kWh` AND SOC reading is valid — otherwise explicitly switches it into autonomous (solar-only) mode. Sends Telegram summary either way. |
-| **B** | Autonomous — target reached | SOC state change, `for: 30s` | Watches SOC all night; switches the inverter back to autonomous mode when SOC ≥ `min(target+2%, 95%)` stable for 30 seconds. The 30 s debounce is intentional — BMS units commonly flap to `unknown` during charging, making longer windows unreliable. |
-| **C** | Emergency night correction | `energy_deficit` crosses 0.7 / 0.3 kWh | Reacts to reality diverging from forecast mid-night. **v2.7** logic (symmetric debounce + symmetric 30-min minimum-runtime guard), **v3.0** actuator — switches to grid-charge mode if deficit climbs above 0.7 kWh for 2 minutes (and inverter's been autonomous ≥30 min); switches back to autonomous if deficit drops below 0.3 kWh for 2 minutes (and inverter's been grid-charging ≥30 min). Fixes a real multi-cycle relay-flapping incident from the breaker era — see [`docs/anti-flapping-case-study.md`](docs/anti-flapping-case-study.md). `mode: restart` so a fresh trigger always wins. |
-| **D** | Morning safety reset | Time 06:58 | Unconditional switch to autonomous mode, no conditions, no notification. This is the layer that *must* work even if everything else is broken. |
-| **E** | Grid recovery | Breaker voltage > 210 V for 2 min | Handles the case where the grid disappeared and came back. The breaker itself stays always-on; its voltage sensor is still read as the "grid actually present" signal. Four branches: resume grid-charge (night + deficit), confirm target already reached → autonomous (night + SOC ok), force autonomous (daytime — avoid paying peak tariff), emergency grid-charge (battery critically low regardless of time). |
-| **F** | Recovery after HA restart | Home Assistant `start` event | If HA itself restarts mid-night, none of A/C/E's triggers fire retroactively. After a 120 s delay (for the BMS and load-history helper to come up), switches the inverter to grid-charge mode if it's in autonomous mode despite `energy_deficit > 0.5 kWh`. Local notification only (persistent_notification, not Telegram). |
+| **A** | Night charge decision | Time 23:05 | Waits up to 5 min for a valid SOC if the sensor is flapping. Deficit > 0.5 kWh + grid present → grid-charge mode. Deficit > 0.5 kWh + no grid → warning only (E/C take over when the grid returns). Otherwise → autonomous mode. Records the starting target in a helper for the notification only — nothing locks it. |
+| **B** | Stop at target | SOC change, `for: 30s` | While grid-charging at night: SOC ≥ `min(live target + 2 %, 95 %)` → autonomous mode. The target falls through the night, so B stops as soon as the battery holds enough for what is *left*. |
+| **C** | Emergency night correction | `energy_deficit` crosses 0.7 / 0.3 kWh | Deficit > 0.7 for 2 min while autonomous and grid present → grid-charge. Deficit < 0.3 after ≥ 30 min of grid-charging and grid present → autonomous. `mode: restart`. |
+| **D** | Morning safety reset | Time 06:58 | Unconditional autonomous mode via the retry script — the layer that must work even if everything else is broken. |
+| **E** | Grid loss / recovery | Grid voltage < 50 V (30 s), > 200 V (2 min), every 15 min | Grid lost while grid-charging → autonomous (keeps HA in sync with the hardware). Grid back at night with deficit > 0.5 → grid-charge (the 15-min tick is the safety net for a missed edge). Target already met → autonomous. Daytime → autonomous. Battery < 49 V → grid-charge. |
+| **F** | Recovery after HA restart | HA `start` + 120 s | Night, deficit > 0.5 kWh, inverter autonomous, grid present → grid-charge. Local notification only. |
 
 ---
 
@@ -113,18 +128,16 @@ All six automations now act on `select.inverter_output_priority` /
 Cheap Zigbee/Tuya smart breakers power their radio chip from the same line they
 switch. When a voltage protection relay upstream cuts the grid, the breaker
 loses power — but before it fully dies it sends garbage readings (10–175 V) to
-Home Assistant instead of going `unavailable`. A naive `> 0 V` check would
-trigger the breaker to "turn on" against a dead chip.
+Home Assistant instead of going `unavailable`. Up to v3.0 this package worked
+around that with a "> 210 V held for 2 minutes" rule on the breaker's voltage.
 
-**Solution used here:** automation E, which reacts to the grid coming back,
-requires `breaker_voltage > 210 V` held for 2 minutes as a precondition
-before acting. Based on 30 days of historical data, phantom readings never
-exceeded 175 V or held a stable value for more than a few minutes. (Pre-v3.0,
-every automation that turned the breaker itself *on* also carried this
-check directly — as of v3.0 the breaker is never actuated, only sensed, so
-the check now lives solely in automation E's trigger.)
+**As of v3.1 the breaker isn't read at all.** Grid presence comes from the
+inverter's own grid-input voltage, measured after the protection relay. The
+inverter runs from the battery, so its reading stays valid through an outage.
+The 2-minute hold on E's recovery trigger is kept anyway.
 
-See [`docs/phantom_voltage.md`](docs/phantom_voltage.md) for full analysis.
+See [`docs/phantom_voltage.md`](docs/phantom_voltage.md) for the original
+analysis.
 
 ---
 
@@ -169,10 +182,18 @@ applies to this package's normal operation.
 
 ## Design patterns worth stealing
 
-**Snapshot the decision, don't chase a moving target.** The target SOC is
-written to `input_number.locked_target_soc` once at 23:05 and never re-read
-during the night. A live-recalculating target would cause the breaker to
-oscillate as the forecast shifts overnight.
+**Don't snapshot the target — buy only what is still needed.** An earlier
+version locked the target SOC at 23:05. It was dropped: the goal is to buy
+exactly as much grid energy as the rest of the night needs, and a target
+frozen at 23:05 ignores a forecast that improves overnight and overpays every
+time it does. The target is recalculated continuously; what keeps the mode
+from oscillating is hysteresis and debounce (B's +2 % buffer, C's 0.7/0.3 band
+and 30-minute guard), not freezing the input.
+
+**One actuator path, verified.** Every mode change goes through one queued
+script that checks the select actually changed, retries once and says which
+automation's command was lost. A Wi-Fi data collector drops writes now and
+then; without the check the house can sit in the wrong mode until 06:58.
 
 **Dumb safety layers are more reliable than smart ones.** Automation D
 deliberately has zero conditions. It resets the inverter to autonomous mode
@@ -200,9 +221,11 @@ weather API is a single point of failure for the most important input. Taking
 `min()` of two sources per hour costs almost nothing and removes an entire
 failure class.
 
-**Confirm real grid presence, not just switch state.** A breaker reporting `on`
-with 50 V across it is not charging anything. Require `voltage > 210 V` for 2
-minutes before acting — not just a non-zero reading.
+**Confirm real grid presence from a device that survives the outage.** A
+breaker reporting `on` with 50 V across it is not charging anything, and a
+breaker's own radio dies with the grid. Read grid voltage from something that
+stays powered (here the battery-backed inverter) and check it in every branch
+that starts charging.
 
 **Recovery from grid loss is not optional.** A system that only works when
 nothing restarts and the grid never blinks is essentially unfinished. Automation
@@ -215,19 +238,24 @@ time-based and threshold-based trigger miss its window just as thoroughly.
 Automation F re-checks state on `homeassistant: start` for the same reason
 automation E re-checks it on grid recovery.
 
-**Scale a static profile with a live signal instead of hand-editing it.** The
-load profile table is a frozen snapshot that goes stale. Rather than
-periodically re-exporting and replacing it, a single live ratio (7-day actual
-average ÷ season's static total, clamped to a sane range) keeps the whole
-table roughly current without turning it into something that needs ongoing
-manual maintenance.
+---
 
-**A percentile forecast is a cheap safety margin, if the source offers one.**
-Solcast's P10 (10th-percentile, pessimistic) estimate costs nothing extra to
-read but is normally ignored in favor of the median (P50) forecast. Blending
-in a configurable fraction of P10 buys protection against cloudy-day
-underperformance for free — the same idea behind Predbat's
-`weather_forecast_pv_quantile_bias`.
+## Known issues
+
+Documented here because the repo mirrors what actually runs:
+
+- **C's debounce is asymmetric.** `stop_charge` fires without `for:` and the
+  start branch has no 30-minute guard. [The case study](docs/anti-flapping-case-study.md)
+  explains why symmetric is better; the running system hasn't been changed.
+- **E daytime vs emergency.** In daytime with the battery below 49 V, the
+  15-minute tick alternates between the emergency branch (grid-charge) and
+  the daytime branch (back to autonomous). The inverter's own low-battery
+  cut-over (52 V) acts first in practice.
+- **B has a dead trigger** (`deficit_below_0_5`) with no matching branch.
+- **A's grid check at 23:05 is an instantaneous reading**, no debounce.
+- **The Open-Meteo hour key uses a hard-coded `+03:00` offset**, so after the
+  switch to winter time Open-Meteo silently drops out of the forecast `min()`.
+  Fixed in v4.0.
 
 ---
 
@@ -237,10 +265,8 @@ underperformance for free — the same idea behind Predbat's
 
 - Home Assistant with an inverter integration exposing output-source-priority
   and charge-source-priority `select` entities (v3.0 actuator)
-- A Zigbee/WiFi smart breaker entity — not actuated, but its voltage sensor is
-  used as the grid-presence signal (automation E); if your inverter has no
-  mode selects, the breaker can still be used as the primary actuator — see
-  the pre-v3.0 shape referenced in the automation YAML comments
+- An inverter grid-input voltage sensor (grid presence) and a battery voltage
+  sensor (automation E's emergency branch)
 - LiFePO4 battery with a BMS that exposes SOC — must resolve to
   `unavailable`/`unknown` (not a stale number) when the BMS is unreachable
 - [Solcast](https://github.com/BJReplay/ha-solcast-solar) integration
@@ -256,8 +282,10 @@ Before importing automations, create these in
 |--------|------|---------|
 | `input_number.battery_capacity_kwh` | Number | Usable battery capacity in kWh |
 | `input_number.minimum_soc_floor` | Number | Minimum SOC % you want at dawn |
-| `input_number.locked_target_soc` | Number | Written by automation A — do not edit manually |
-| `input_number.solcast_p10_bias` | Number (0–1) | Blend weight toward Solcast's pessimistic P10 forecast — default 0.3 |
+| `input_number.locked_target_soc` | Number | Written by automation A at 23:05 for the notification text only |
+
+Also create the script from [`scripts/set_mode_with_retry.yaml`](scripts/set_mode_with_retry.yaml)
+with the id `inverter_set_mode_with_retry`.
 
 ### Entity ID mapping
 
@@ -267,13 +295,13 @@ All entity IDs in this repo use generic names. Map them to your actual entities:
 |-------------|------------------|
 | `select.inverter_output_priority` | Your inverter's output-source-priority select. Options used in this repo: `AUTONOMOUS` (your inverter's "prioritize battery/solar over grid" mode, e.g. "PV-Battery-Utility"/"SBU") and `GRID_CHARGE` (your inverter's "prioritize grid for charging" mode, e.g. "PV-Utility-Battery"/"SUB") — substitute your integration's actual option strings |
 | `select.inverter_charge_priority` | Your inverter's charge-source-priority select. Options used in this repo: `SOLAR_ONLY` (e.g. "PV Priority") and `SOLAR_AND_GRID` (e.g. "PV and Utility") — substitute your integration's actual option strings |
-| `switch.grid_switch` | Your smart breaker switch entity — left permanently on, not actuated by this package as of v3.0 |
-| `sensor.breaker_voltage` | Voltage sensor on the breaker — still read by automation E as the grid-presence signal |
-| `sensor.battery_soc_effective` | Your BMS SOC sensor (must go `unavailable`, not stale) |
+| `sensor.inverter_grid_voltage` | Grid voltage as seen by the inverter's input (after any protection relay) — the grid-presence signal |
+| `sensor.battery_voltage` | Battery voltage (automation E's emergency branch) |
+| `sensor.battery_soc_effective` | Your SOC sensor (must go `unavailable`, not stale) |
 | `sensor.pv_forecast_today/tomorrow` | Solcast entities |
 | `sensor.energy_production_today/tomorrow` | Open-Meteo Solar Forecast entities — PV array 1 |
 | `sensor.energy_production_today/tomorrow_array2` | Open-Meteo Solar Forecast entities — PV array 2 (omit if you only have one array; see `docs/model.md`) |
-| `sensor.avg_load_7d` | A 7-day rolling average daily load — e.g. a Statistics helper (`state_characteristic: change`, `max_age: 7 days`) on your inverter-output energy sensor. Drives the live load correction (see `docs/model.md`) |
+| `sensor.avg_load_7d` | A 7-day rolling average daily load — used only by automation F as a "statistics helper has data" check |
 | `notify.YOUR_TELEGRAM_BOT` | Your Telegram notify entity |
 
 ### Load profile
@@ -281,10 +309,7 @@ All entity IDs in this repo use generic names. Map them to your actual entities:
 The `load_profile_by_season` dict in the sensor templates is built from one
 specific household's data. **It will not match your house.** Export your own
 hourly consumption averages from your energy monitoring tool and replace the
-values before deploying. If you replace it, also update `season_daily_totals`
-(the daily kWh sum per season) — it feeds the live load-correction factor
-described in `docs/model.md`, and the two will silently disagree if only one
-is updated.
+values before deploying, in both sensor templates.
 
 ---
 

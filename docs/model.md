@@ -131,12 +131,12 @@ against those two selects instead:
 | `switch.turn_on` (breaker) | `select.select_option` → `GRID_CHARGE` on output priority + `SOLAR_AND_GRID` on charge priority |
 | `switch.turn_off` (breaker) | `select.select_option` → `AUTONOMOUS` on output priority + `SOLAR_ONLY` on charge priority |
 
-The breaker's voltage sensor is **still read** (automation E still triggers
-off it) — it remains the most reliable "is the grid actually present" signal,
-since the breaker's radio chip is powered from the same upstream line the
-grid protection relay switches, independent of whether Home Assistant ever
-commands the relay itself. What changed is that the breaker is no longer an
-*actuator* in this package, only a *sensor*.
+Up to v3.0 the breaker's voltage sensor was still read as the grid-presence
+signal. **As of v3.1 it isn't:** every automation checks the inverter's own
+grid-input voltage instead (measured after the household's voltage-protection
+relay, threshold 200 V). The inverter is battery-powered, so that reading stays
+valid through an outage, unlike the breaker's radio chip (see
+[`phantom_voltage.md`](phantom_voltage.md)).
 
 **Why this is a better fix, not just a different one:**
 - A relay has a finite mechanical cycle life; an inverter-firmware mode
@@ -161,8 +161,7 @@ commands the relay itself. What changed is that the breaker is no longer an
 | Battery capacity | `input_number.battery_capacity_kwh` | Set to your usable kWh |
 | Charge threshold | 0.5 kWh | `energy_deficit > 0.5` triggers automation A |
 | Night window | 23:00–11:00 | Wide enough for slow winter sunrise |
-| Solcast P10 bias | `input_number.solcast_p10_bias`, default 0.3 | 0–1 blend weight toward Solcast's pessimistic P10 forecast (see below) |
-| Load correction bounds | [0.7, 1.8] | Clamp on the live load-correction factor (see below) |
+| Forecast source filter | > 10 Wh | A source counts for an hour only if it forecasts more than 10 Wh |
 
 ## Load profile
 
@@ -173,42 +172,19 @@ applied in Python, not in Flux — the `location:` parameter in
 `aggregateWindow()` was found to be non-functional in the InfluxDB version
 used).
 
-### Live load correction
+### Removed in v3.1: live load correction and Solcast P10 blending
 
-The static table is a frozen snapshot — it drifts out of date as household
-consumption changes. Rather than editing the table by hand, the sensor
-compares a live 7-day rolling average (`sensor.avg_load_7d`, a Statistics
-helper) against the season's static daily total and scales every hourly
-value in the table by the ratio:
+Earlier versions of this repo documented two refinements — scaling the
+hourly profile by a live 7-day-average ratio, and blending a fraction of
+Solcast's pessimistic P10 estimate into the Solcast side of the `min()`. They
+are not part of the system that actually runs, so v3.1 removes them from the
+templates and from this document. The idea behind P10 blending is taken up
+differently in v4.0 (a single derating factor applied to the combined
+forecast).
 
-```
-load_correction_raw = live_avg_load / season_daily_total
-load_correction     = clamp(load_correction_raw, 0.7, 1.8)
-load_wh[h]          = load_profile[season][h] * load_correction
-```
-
-The clamp exists so a single bad reading — or the Statistics helper not
-having accumulated 7 days of history yet — can't scale the whole profile to
-an extreme value. `season_daily_totals` must be kept equal to the sum of
-`load_profile_by_season[season]` for each season; if you replace the hourly
-table with your own data, recompute this total too.
-
-### Solcast P10/P50 blending
-
-Solcast's `detailedHourly` forecast exposes both `pv_estimate` (P50, the
-median forecast) and `pv_estimate10` (P10 — "10% chance actual generation is
-this low or lower"). Using P50 alone means roughly half of all cloudy days
-will underperform the forecast. Blending a configurable fraction of P10 into
-the Solcast side of the calculation adds a safety margin against that:
-
-```
-sc_estimate = sc_p50 * (1 - p10_bias) + sc_p10 * p10_bias
-```
-
-`input_number.solcast_p10_bias` controls the blend (0 = pure P50, 1 = pure
-P10; default 0.3). This is independent of, and happens *before*, the
-existing `min(Solcast, Open-Meteo)` step — it only makes the Solcast side of
-that comparison more conservative.
+The forecast-source rule in production is also simpler than the earlier
+"count a source if it has a data point" version: a source counts for an hour
+only if it forecasts more than 10 Wh.
 
 Three seasons:
 
@@ -227,25 +203,11 @@ deploying. These numbers are specific to one home and will not transfer.
 
 ## Open questions / deliberately deferred
 
-- **Forecast error buffer — partially addressed.** The model originally
-  trusted the forecast at face value. Solcast P10/P50 blending (see above)
-  now adds a configurable safety margin on the Solcast side specifically;
-  Open-Meteo has no equivalent percentile data to blend, so its side of the
-  `min()` is still taken at face value. A true buffer applied after the
-  `min()` (inflating the deficit uniformly regardless of source) remains
-  undone.
+- **Forecast error buffer.** The model takes the forecast at face value
+  (pessimistic `min()` of two sources plus a fixed 1.5 kWh reserve). A
+  derating factor is added in v4.0.
 - **Full kWh-based comparison throughout.** Internal calculations are energy-
   based (kWh), but the threshold comparisons in automations B and E still
-  compare SOC percentages. A full conversion to kWh everywhere is a reasonable
-  next step, not yet done.
-- **Rolling load profile — addressed via a correction factor, not a rewrite.**
-  The hourly table itself is still a static snapshot, but it's now scaled by
-  a live 7-day-average correction factor (see above) rather than left to
-  drift unchecked. Replacing the table's *shape* (not just its overall scale)
-  would require an actual rolling-average rebuild of the hourly table, which
-  is not implemented.
-- **Second array's own Solcast P10/P50 characteristics not modeled
-  separately.** Both arrays share one `solcast_p10_bias` blend weight even
-  though they're two different orientations with potentially different
-  cloud-sensitivity profiles. Not addressed — the effect is expected to be
-  second-order compared to the existing conservative `min()` step.
+  compare SOC percentages.
+- **Load profile drift.** The hourly table is a static snapshot; the winter
+  profile is still a copy of the transition profile.

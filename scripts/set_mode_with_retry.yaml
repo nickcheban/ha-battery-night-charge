@@ -1,0 +1,100 @@
+# Script: set inverter mode with retry
+# =====================================
+# Single entry point every automation in this package uses to change the
+# inverter's output/charge priority. Added in v3.1 (it had been running in
+# production for a while before the repo caught up).
+#
+# Why a script instead of two select.select_option calls in each automation:
+#   - The inverter is reached through a Wi-Fi data collector. Occasionally a
+#     write is silently dropped. The script checks that the output-priority
+#     select actually changed, waits 30 s and retries once, and only then
+#     notifies — tagged with the automation that asked, so the message says
+#     who wanted what.
+#   - mode: queued — if two automations ask for a mode change within seconds of
+#     each other (e.g. a grid-recovery run and a target-reached run), the second
+#     request waits for the first instead of being dropped or interleaving.
+#
+# Known limitation: only output_priority is verified and retried;
+# charge_priority is written once without a check.
+#
+# Entity ID mapping (replace with your own):
+#   select.inverter_output_priority → output-source-priority select
+#   select.inverter_charge_priority → charge-source-priority select
+#   notify.YOUR_TELEGRAM_BOT        → your Telegram notify entity
+#
+# Save as script id: inverter_set_mode_with_retry
+# (automations call it as script.inverter_set_mode_with_retry)
+
+alias: "EMS: Set inverter mode with retry"
+description: >
+  Applies output_priority (verified, one retry after 30 s, Telegram alert if
+  both attempts fail), then charge_priority. Queued so concurrent callers
+  don't lose commands.
+mode: queued
+max: 5
+fields:
+  output_priority:
+    name: Output priority
+    description: Target option for select.inverter_output_priority (AUTONOMOUS / GRID_CHARGE)
+    required: true
+    selector:
+      text:
+  charge_priority:
+    name: Charge priority
+    description: Target option for select.inverter_charge_priority (SOLAR_ONLY / SOLAR_AND_GRID)
+    required: true
+    selector:
+      text:
+  caller_tag:
+    name: Caller tag
+    description: Which automation is calling (A, B, C, D, E, G) — shown in the alert
+    required: true
+    selector:
+      text:
+  fail_context:
+    name: Fail context
+    description: Optional extra sentence for the alert (e.g. "charging did NOT start")
+    default: ""
+    selector:
+      text:
+sequence:
+  - alias: "Output priority, attempt 1"
+    action: select.select_option
+    continue_on_error: true
+    target:
+      entity_id: select.inverter_output_priority
+    data:
+      option: "{{ output_priority }}"
+  - alias: "Retry after 30 s if it didn't stick"
+    if:
+      - condition: template
+        value_template: "{{ not is_state('select.inverter_output_priority', output_priority) }}"
+    then:
+      - delay:
+          seconds: 30
+      - alias: "Output priority, attempt 2"
+        action: select.select_option
+        continue_on_error: true
+        target:
+          entity_id: select.inverter_output_priority
+        data:
+          option: "{{ output_priority }}"
+      - if:
+          - condition: template
+            value_template: "{{ not is_state('select.inverter_output_priority', output_priority) }}"
+        then:
+          - action: notify.send_message
+            target:
+              entity_id: notify.YOUR_TELEGRAM_BOT
+            data:
+              message: >
+                ⚠️ {{ caller_tag }}: command {{ output_priority }} did not reach the inverter.
+                Both attempts failed.{{ ' ' + fail_context if fail_context else '' }}
+                Check the inverter's data collector.
+  - alias: "Charge priority (single write, not verified)"
+    action: select.select_option
+    continue_on_error: true
+    target:
+      entity_id: select.inverter_charge_priority
+    data:
+      option: "{{ charge_priority }}"

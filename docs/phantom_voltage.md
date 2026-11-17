@@ -1,5 +1,12 @@
 # Phantom voltage: the Zigbee breaker problem
 
+> **Note (v3.1):** the package no longer reads the breaker's voltage sensor at
+> all. Grid presence is now taken from the inverter's own grid-input voltage
+> (measured after the upstream voltage-protection relay, threshold 200 V).
+> The inverter is battery-powered, so it keeps reporting correctly through an
+> outage and none of the phantom behaviour below applies to it. This document
+> is kept as the record of why the breaker sensor was a poor grid signal.
+
 > **Note (v3.0):** as of the [inverter mode switching](model.md#inverter-mode-switching)
 > change, the breaker is left permanently energised and is no longer
 > commanded on/off by this package — but its voltage sensor is still read

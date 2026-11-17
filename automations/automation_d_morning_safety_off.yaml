@@ -1,38 +1,22 @@
 # Automation D: Morning safety reset — unconditional
 # =====================================================
-# Switches the inverter back to autonomous (solar-only) mode at 06:58 every
-# morning. No conditions. No notification. No exceptions.
+# Switches the inverter back to autonomous mode at 06:58 every morning.
+# No conditions. No exceptions. This is the dumb safety layer that exists
+# because smart logic can fail: whatever A, B, C or E did (or failed to do)
+# overnight, the inverter is out of grid-charge mode before daytime tariff.
 #
-# This is the dumb safety layer that exists specifically because smart logic
-# can fail. If automation A misfired, if B never triggered, if C got stuck,
-# if the BMS is unavailable, if the forecast API was down all night — this
-# automation fires anyway and takes the inverter out of grid-charge mode
-# before daytime peak tariff.
+# ── v3.1 — synced with production ──────────────────────────────────────────
+# Goes through script.inverter_set_mode_with_retry, so a dropped write is
+# retried once after 30 s and reported if it still fails ("inverter stays in
+# grid-charge mode all day" is exactly the failure this automation exists to
+# prevent, so it's worth knowing about).
 #
-# v3.0 — retargeted from switch.turn_off (physical breaker) to
-# select.select_option (inverter mode). Same "must work even if everything
-# else is broken" role — see docs/model.md#inverter-mode-switching.
-#
-# Deliberately minimal:
-#   - No conditions: must work even if every sensor is unavailable
-#   - No notification: was removed by user request — a "target not reached"
-#     notification based on a snapshot from 23:05 was misleading by 06:58
-#     (the target was stale, and the inverter mode was already being managed
-#     by automations B and C throughout the night)
-#   - mode: single: cannot fire twice
-#
-# Entity ID mapping (replace with your own):
-#   select.inverter_output_priority → inverter's output-source-priority select
-#     (option used here: AUTONOMOUS — vendor-specific string, see automation_a)
-#   select.inverter_charge_priority → inverter's charge-source-priority select
-#     (option used here: SOLAR_ONLY — vendor-specific string, see automation_a)
+# Entity ID mapping: script.inverter_set_mode_with_retry
 
-alias: "EMS: Morning safety reset (D)"
+alias: "EMS: Morning safety reset 06:58 (D)"
 description: >
-  v3.0 — unconditional switch to autonomous (solar-only) inverter mode at
-  06:58. Safety layer, no conditions, no notification. This is the
-  automation that must work even if everything else is broken. Retargeted
-  from a physical breaker (v2.4) to the inverter's own mode selects.
+  v3.1 — unconditional switch to autonomous mode at 06:58 via the retry
+  script. Safety layer.
 
 triggers:
   - trigger: time
@@ -41,16 +25,12 @@ triggers:
 conditions: []
 
 actions:
-  - action: select.select_option
-    target:
-      entity_id: select.inverter_output_priority
+  - action: script.inverter_set_mode_with_retry
     data:
-      option: AUTONOMOUS
-  - action: select.select_option
-    target:
-      entity_id: select.inverter_charge_priority
-    data:
-      option: SOLAR_ONLY
+      output_priority: AUTONOMOUS
+      charge_priority: SOLAR_ONLY
+      caller_tag: D
+      fail_context: "Inverter stays in grid-charge mode all day!"
 
 mode: single
 trace:
